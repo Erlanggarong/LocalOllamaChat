@@ -3,6 +3,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import MarkdownRenderer from "@/components/MarkdownRenderer";
 import DynamicBackground from "@/components/DynamicBackground";
+import { searchWithContent } from "@/lib/web-search";
 
 interface MessageMetrics {
   evalCount?: number;
@@ -64,44 +65,6 @@ function getSessionTitle(messages: Message[]): string {
   return "New Chat";
 }
 
-// Web Search using DuckDuckGo HTML
-async function fetchWebSearch(query: string): Promise<string[]> {
-  try {
-    const res = await fetch(
-      `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-      }
-    );
-    if (!res.ok) throw new Error("Search failed");
-    const html = await res.text();
-
-    // Parse HTML with DOMParser
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-
-    const results: string[] = [];
-    const resultElements = doc.querySelectorAll(".result");
-
-    resultElements.forEach((el, idx) => {
-      if (idx >= 5) return; // Top 5 results
-      const titleEl = el.querySelector(".result__a");
-      const snippetEl = el.querySelector(".result__snippet");
-      const title = titleEl?.textContent?.trim();
-      const snippet = snippetEl?.textContent?.trim();
-      if (title && snippet) {
-        results.push(`${idx + 1}. ${title}\n${snippet}`);
-      }
-    });
-
-    return results;
-  } catch (err) {
-    console.error("Web search error:", err);
-    return [];
-  }
-}
 
 // Compress/resize image using canvas before sending
 function compressImage(
@@ -553,10 +516,24 @@ export default function ChatPage() {
     let webSearchContext = "";
     if (webSearchEnabled) {
       setIsSearchingWeb(true);
-      const searchResults = await fetchWebSearch(userContent);
-      setIsSearchingWeb(false);
-      if (searchResults.length > 0) {
-        webSearchContext = `Use the following web search results to help answer the query. Cite sources when appropriate:\n\n${searchResults.join("\n\n---\n\n")}\n\n`;
+      try {
+        const searchResponse = await searchWithContent(userContent, 5, true);
+        setIsSearchingWeb(false);
+        if (searchResponse.results.length > 0) {
+          const formattedResults = searchResponse.results.map((r, idx) => {
+            let text = (idx + 1) + ". " + r.title + "\n" + "URL: " + r.url + "\n" + "Description: " + r.description;
+            if (r.fullContent && r.fullContent.trim()) {
+              text += "\n\nFull Content:\n" + r.fullContent;
+            }
+            return text;
+          });
+          webSearchContext = "Use the following web search results to help answer the query. Cite sources when appropriate.\n\n" +
+            "Status: " + searchResponse.status + "\n\n" +
+            formattedResults.join("\n\n---\n\n") + "\n\n";
+        }
+      } catch (err) {
+        setIsSearchingWeb(false);
+        console.error("Web search error:", err);
       }
     }
 
