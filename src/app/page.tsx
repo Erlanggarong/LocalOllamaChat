@@ -567,7 +567,23 @@ export default function ChatPage() {
     updateSessionMessages(activeSessionId, messagesWithAssistant);
 
     // Build messages payload
-    const systemMessages: Message[] = [{ role: "system", content: systemPrompt }];
+    // Dynamic time-awareness: inject current date/time so the LLM knows "today"
+    const now = new Date();
+    const currentDate = now.toLocaleString("en-US", {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZoneName: "short",
+    });
+    const timeAwarenessPrompt = `For your context, today's current date and time is: ${currentDate}. Always base your real-time or time-sensitive answers on this date.`;
+
+    const systemMessages: Message[] = [
+      { role: "system", content: timeAwarenessPrompt },
+      { role: "system", content: systemPrompt },
+    ];
     if (webSearchContext) {
       systemMessages.push({ role: "system", content: webSearchContext });
     }
