@@ -1,7 +1,7 @@
 [package]
 name = "my-kizo"
 version = "0.1.0"
-description = "My Kizo - Local LLM Chat Desktop App"
+description = "My-Kizo - Local LLM Chat Desktop App"
 authors = ["you"]
 license = "MIT"
 repository = ""

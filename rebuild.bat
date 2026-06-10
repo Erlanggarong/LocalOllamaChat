@@ -1,6 +1,6 @@
 @echo off
 echo ==========================================
-echo  My Kizo - Clean Rebuild Script
+echo  My-Kizo - Clean Rebuild Script
 echo ==========================================
 echo.
 

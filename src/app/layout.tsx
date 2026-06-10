@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "My Kizo",
+  title: "My-Kizo",
   description: "Local LLM Chat Interface",
 };
 

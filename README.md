@@ -1,8 +1,8 @@
-# My Kizo
+# My-Kizo
 
 A sleek, modern desktop chat interface for local LLMs (Ollama) built with **Tauri (Rust)** + **Next.js 14** + **TailwindCSS**.
 
-Named **My Kizo** — your personal AI companion that runs entirely locally.
+Named **My-Kizo** — your personal AI companion that runs entirely locally.
 
 ## Features
 

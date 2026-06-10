@@ -870,7 +870,7 @@ export default function ChatPage() {
               </svg>
             </div>
             <div>
-              <h1 className="text-sm font-semibold text-white tracking-tight">My Kizo</h1>
+              <h1 className="text-sm font-semibold text-white tracking-tight">My-Kizo</h1>
               <p className="text-[10px] text-slate-500 font-medium">AI Companion</p>
             </div>
           </div>
