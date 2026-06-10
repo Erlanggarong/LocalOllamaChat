@@ -2,8 +2,13 @@
  * Multi-engine web search with content extraction.
  *
  * All HTTP requests go through a custom Rust backend command (reqwest)
- * to bypass CORS/bot-detection entirely. Parsing uses resilient,
- * generic selectors instead of brittle class names.
+ * to bypass CORS/bot-detection entirely.
+ *
+ * Features:
+ *  - URL bypass: if user prompt contains a URL, fetch it directly
+ *  - Structured HTML parsing: extracts tables, lists, headings, paragraphs
+ *  - Query rewriting: conversational queries rewritten via local LLM
+ *  - Fallback chain: DDG API → Wikipedia → Bing → DDG Lite
  */
 
 import { invoke } from "@tauri-apps/api/tauri";
@@ -41,15 +46,121 @@ function logRaw(label: string, body: string, maxLen = 2000) {
   console.log(`[Web Search] Raw ${label} (${body.length} chars):`, preview);
 }
 
-// ========== 1. WIKIPEDIA API (JSON) ==========
+// ========== URL DETECTION ==========
 
-async function searchWikipedia(query: string, limit: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying Wikipedia API...");
-  const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${limit}&format=json&utf8=1&redirects=1`;
+const URL_REGEX = /https?:\/\/[^\s<>"'{}|\^`\[\]]+/i;
+
+function extractUrlFromQuery(query: string): string | null {
+  const match = query.match(URL_REGEX);
+  return match ? match[0] : null;
+}
+
+// ========== STRUCTURED HTML PARSER (tables, lists, headings, paragraphs) ==========
+
+function formatTable(tableEl: Element): string {
+  const caption = tableEl.querySelector("caption")?.textContent?.trim();
+  const rows: string[] = [];
+
+  tableEl.querySelectorAll("tr").forEach((tr) => {
+    const cells: string[] = [];
+    tr.querySelectorAll("th, td").forEach((cell) => {
+      const text = cell.textContent?.trim().replace(/\s+/g, " ");
+      if (text !== undefined) cells.push(text);
+    });
+    if (cells.length > 0) rows.push(cells.join(" | "));
+  });
+
+  if (rows.length === 0) return "";
+
+  let result = caption ? `Table: ${caption}\n` : "Table:\n";
+  result += rows.join("\n");
+  return result;
+}
+
+function formatList(listEl: Element, numbered: boolean): string {
+  const items: string[] = [];
+  Array.from(listEl.children).forEach((child, idx) => {
+    if (child.tagName.toLowerCase() !== "li") return;
+    const text = child.textContent?.trim().replace(/\s+/g, " ");
+    if (text) {
+      items.push(numbered ? `${idx + 1}. ${text}` : `- ${text}`);
+    }
+  });
+  return items.join("\n");
+}
+
+function extractStructuredText(root: Element, maxLength: number): string {
+  const parts: string[] = [];
+
+  function walk(el: Element) {
+    if (parts.join("\n").length > maxLength) return;
+
+    const tag = el.tagName.toLowerCase();
+
+    // Skip noise elements entirely
+    const skipTags = [
+      "script", "style", "nav", "header", "footer", "aside",
+      "noscript", "svg", "canvas", "iframe", "form", "button",
+    ];
+    if (skipTags.includes(tag)) return;
+
+    // Handle tables — format and do NOT recurse into children
+    if (tag === "table") {
+      const t = formatTable(el);
+      if (t) parts.push(t);
+      return;
+    }
+
+    // Handle lists — format and do NOT recurse into children
+    if (tag === "ul" || tag === "ol") {
+      const l = formatList(el, tag === "ol");
+      if (l) parts.push(l);
+      return;
+    }
+
+    // Handle headings
+    if (["h1", "h2", "h3", "h4", "h5", "h6"].includes(tag)) {
+      const text = el.textContent?.trim();
+      if (text) parts.push(`\n${text}\n`);
+      return;
+    }
+
+    // Handle paragraphs
+    if (tag === "p") {
+      const text = el.textContent?.trim();
+      if (text && text.length > 5) parts.push(text);
+      return;
+    }
+
+    // For other elements with no element children, capture leaf text
+    if (el.children.length === 0) {
+      const text = el.textContent?.trim();
+      if (text && text.length > 10) parts.push(text);
+      return;
+    }
+
+    // Recurse into container elements (div, section, span, etc.)
+    for (const child of Array.from(el.children)) {
+      walk(child);
+    }
+  }
+
+  for (const child of Array.from(root.children)) {
+    walk(child);
+  }
+
+  // Clean up excessive newlines
+  return parts.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// ========== API-BASED SEARCH ENGINES ==========
+
+async function searchDuckDuckGoAPI(query: string, limit: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying DuckDuckGo Instant Answer API...");
+  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=mykizo`;
 
   const { status, body } = await rustFetch(url);
-  console.log("[Web Search] Wikipedia status:", status);
-  logRaw("Wikipedia", body, 1500);
+  console.log("[Web Search] DDG API status:", status);
 
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!body || body.length < 50) throw new Error("Empty response");
@@ -61,18 +172,82 @@ async function searchWikipedia(query: string, limit: number): Promise<SearchResu
     throw new Error("Invalid JSON");
   }
 
-  // Check for API-level errors
+  const results: SearchResult[] = [];
+
+  if (data.AbstractText && data.AbstractURL) {
+    results.push({
+      title: data.Heading || query,
+      url: data.AbstractURL,
+      description: data.AbstractText,
+    });
+  }
+
+  for (const topic of data.RelatedTopics || []) {
+    if (results.length >= limit) break;
+    if (topic.Text && topic.FirstURL) {
+      results.push({
+        title: topic.Text.split(" - ")[0] || topic.Text.substring(0, 60),
+        url: topic.FirstURL,
+        description: topic.Text,
+      });
+    }
+    if (topic.Topics) {
+      for (const sub of topic.Topics) {
+        if (results.length >= limit) break;
+        if (sub.Text && sub.FirstURL) {
+          results.push({
+            title: sub.Text.split(" - ")[0] || sub.Text.substring(0, 60),
+            url: sub.FirstURL,
+            description: sub.Text,
+          });
+        }
+      }
+    }
+  }
+
+  for (const r of data.Results || []) {
+    if (results.length >= limit) break;
+    if (r.Text && r.FirstURL) {
+      results.push({
+        title: r.Text.split(" - ")[0] || r.Text.substring(0, 60),
+        url: r.FirstURL,
+        description: r.Text,
+      });
+    }
+  }
+
+  console.log("[Web Search] DDG API parsed:", results.length);
+  return results;
+}
+
+async function searchWikipedia(query: string, limit: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying Wikipedia API...");
+  const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${limit}&format=json&utf8=1&redirects=1`;
+
+  const { status, body } = await rustFetch(searchUrl);
+  console.log("[Web Search] Wikipedia search status:", status);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!body) throw new Error("Empty response");
+
+  let data: any;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error("Invalid JSON");
+  }
+
   if (data.error) {
     throw new Error(`Wikipedia API error: ${data.error.info || JSON.stringify(data.error)}`);
   }
 
   const searchResults = data?.query?.search;
   if (!Array.isArray(searchResults)) {
-    console.log("[Web Search] Wikipedia unexpected structure keys:", Object.keys(data));
-    throw new Error("Unexpected JSON structure: query.search missing");
+    console.log("[Web Search] Wikipedia unexpected keys:", Object.keys(data));
+    throw new Error("Unexpected JSON structure");
   }
 
-  console.log("[Web Search] Wikipedia raw results count:", searchResults.length);
+  console.log("[Web Search] Wikipedia raw results:", searchResults.length);
 
   const results: SearchResult[] = [];
   for (const item of searchResults.slice(0, limit)) {
@@ -80,7 +255,7 @@ async function searchWikipedia(query: string, limit: number): Promise<SearchResu
     if (!title) continue;
     const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
     const snippet = (item.snippet || "")
-      .replace(/<[^>]+>/g, "") // strip HTML tags
+      .replace(/<[^>]+>/g, "")
       .replace(/&quot;/g, '"')
       .replace(/&#039;/g, "'")
       .replace(/&amp;/g, "&")
@@ -116,106 +291,21 @@ async function fetchWikipediaExtract(title: string, maxLength: number): Promise<
   return "";
 }
 
-// ========== 2. DUCKDUCKGO INSTANT ANSWER API (JSON) ==========
+// ========== HTML SCRAPING FALLBACKS ==========
 
-async function searchDuckDuckGoAPI(query: string, limit: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying DuckDuckGo Instant Answer API...");
-  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=mykizo`;
-
-  const { status, body } = await rustFetch(url);
-  console.log("[Web Search] DDG API status:", status);
-  logRaw("DDG API", body, 1500);
-
-  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
-  if (!body || body.length < 50) throw new Error("Empty response");
-
-  let data: any;
-  try {
-    data = JSON.parse(body);
-  } catch {
-    throw new Error("Invalid JSON");
-  }
-
-  const results: SearchResult[] = [];
-
-  // Main abstract
-  if (data.AbstractText && data.AbstractURL) {
-    results.push({
-      title: data.Heading || query,
-      url: data.AbstractURL,
-      description: data.AbstractText,
-    });
-    console.log("[Web Search] DDG API abstract:", data.Heading, "|", data.AbstractText.substring(0, 80));
-  }
-
-  // Related topics
-  const related = data.RelatedTopics || [];
-  for (const topic of related) {
-    if (results.length >= limit) break;
-    if (topic.Text && topic.FirstURL) {
-      results.push({
-        title: topic.Text.split(" - ")[0] || topic.Text.substring(0, 60),
-        url: topic.FirstURL,
-        description: topic.Text,
-      });
-    }
-    if (topic.Topics) {
-      for (const sub of topic.Topics) {
-        if (results.length >= limit) break;
-        if (sub.Text && sub.FirstURL) {
-          results.push({
-            title: sub.Text.split(" - ")[0] || sub.Text.substring(0, 60),
-            url: sub.FirstURL,
-            description: sub.Text,
-          });
-        }
-      }
-    }
-  }
-
-  // Results array
-  for (const r of data.Results || []) {
-    if (results.length >= limit) break;
-    if (r.Text && r.FirstURL) {
-      results.push({
-        title: r.Text.split(" - ")[0] || r.Text.substring(0, 60),
-        url: r.FirstURL,
-        description: r.Text,
-      });
-    }
-  }
-
-  console.log("[Web Search] DDG API parsed:", results.length);
-  return results;
-}
-
-// ========== 3. GENERIC HTML SCRAPING (resilient, no brittle classes) ==========
-
-/**
- * Generic search-result extractor from HTML.
- * Instead of relying on obfuscated class names, we look for structural patterns:
- *  - <li> elements containing an <a> with an external URL
- *  - Nearby <p> or <div> with substantial text for the description
- */
-function extractResultsFromHtml(
-  html: string,
-  numResults: number,
-  engineName: string
-): SearchResult[] {
+function extractResultsFromHtml(html: string, numResults: number, engineName: string): SearchResult[] {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
 
   const results: SearchResult[] = [];
   const seenUrls = new Set<string>();
 
-  // Strategy 1: Look for <li> or <div> containers that have both a link and text
   const containers = doc.querySelectorAll("li, div, article");
   console.log(`[Web Search] ${engineName} scanning ${containers.length} containers...`);
 
   for (const container of Array.from(containers)) {
     if (results.length >= numResults) break;
 
-    // Find the primary link in this container
     const links = container.querySelectorAll("a[href]");
     let bestLink: HTMLAnchorElement | null = null;
 
@@ -224,19 +314,16 @@ function extractResultsFromHtml(
       const href = a.getAttribute("href") || "";
       const text = (a.textContent || "").trim();
 
-      // Skip internal/navigation links
       if (!href.startsWith("http")) continue;
       if (href.includes("bing.com") || href.includes("duckduckgo.com") || href.includes("microsoft.com")) continue;
       if (text.length < 3) continue;
 
-      // Prefer links inside headings (h2, h3)
       const parentTag = a.parentElement?.tagName.toLowerCase() || "";
       const grandparentTag = a.parentElement?.parentElement?.tagName.toLowerCase() || "";
       if (parentTag === "h2" || parentTag === "h3" || grandparentTag === "h2" || grandparentTag === "h3") {
         bestLink = a;
         break;
       }
-      // Otherwise pick the first valid one
       if (!bestLink) bestLink = a;
     }
 
@@ -244,37 +331,30 @@ function extractResultsFromHtml(
 
     const url = bestLink.getAttribute("href") || "";
     const title = (bestLink.textContent || "").trim();
-
     if (!url || !title || seenUrls.has(url)) continue;
 
-    // Find description: look for <p> or text-rich <div> inside same container
     let description = "";
     const textEls = container.querySelectorAll("p, span, div");
     for (const el of Array.from(textEls)) {
       const txt = (el.textContent || "").trim();
-      // Must be substantial, and NOT just the title repeated
       if (txt.length > 20 && txt !== title && !txt.includes(title)) {
         description = txt;
         break;
       }
     }
 
-    // Fallback: if no <p> found, try the container's own text minus the link text
     if (!description) {
       const containerText = (container.textContent || "").replace(title, "").trim();
-      if (containerText.length > 20) {
-        description = containerText.substring(0, 300);
-      }
+      if (containerText.length > 20) description = containerText.substring(0, 300);
     }
 
     if (description) {
-      console.log(`[Web Search] ${engineName} candidate: "${title.substring(0, 60)}..." | ${url.substring(0, 60)}... | desc:${description.substring(0, 80)}...`);
+      console.log(`[Web Search] ${engineName} candidate: "${title.substring(0, 60)}..." | desc:${description.substring(0, 80)}...`);
       seenUrls.add(url);
       results.push({ title, url, description: description.substring(0, 500) });
     }
   }
 
-  // Strategy 2: If still nothing, scan ALL <a> tags with external URLs
   if (results.length === 0) {
     console.log(`[Web Search] ${engineName} fallback: scanning all <a> tags...`);
     const allLinks = doc.querySelectorAll("a[href^='http']");
@@ -288,12 +368,9 @@ function extractResultsFromHtml(
       if (text.length < 5 || text.length > 200) continue;
       if (seenUrls.has(href)) continue;
 
-      // Look for a nearby sibling/parent text node as description
       let description = "";
-      let sibling = a.parentElement?.nextElementSibling;
-      if (sibling) {
-        description = (sibling.textContent || "").trim();
-      }
+      const sibling = a.parentElement?.nextElementSibling;
+      if (sibling) description = (sibling.textContent || "").trim();
       if (!description && a.parentElement) {
         description = (a.parentElement.textContent || "").replace(text, "").trim();
       }
@@ -335,14 +412,10 @@ async function searchDuckDuckGoLite(query: string, numResults: number): Promise<
   return extractResultsFromHtml(html, numResults, "DDG Lite");
 }
 
-// ========== CONTENT EXTRACTION ==========
+// ========== CONTENT EXTRACTION (tables, lists, headings, paragraphs) ==========
 
 function isPdfUrl(url: string): boolean {
   return url.toLowerCase().endsWith(".pdf");
-}
-
-function cleanExtractedText(text: string): string {
-  return text.replace(/\s+/g, " ").replace(/\n\s*\n/g, "\n").trim();
 }
 
 export async function extractPageContent(
@@ -353,14 +426,14 @@ export async function extractPageContent(
     return { content: "", status: "error", error: "PDF files not supported" };
   }
 
-  // Wikipedia: use API instead of scraping
+  // Wikipedia: prefer API extract for the lead section, then supplement with structured HTML
   if (url.includes("wikipedia.org") || url.includes("wikimedia.org")) {
     const titleMatch = url.match(/wiki\/(.+)$/);
     if (titleMatch) {
       const title = decodeURIComponent(titleMatch[1]).replace(/_/g, " ");
-      const extract = await fetchWikipediaExtract(title, maxLength);
-      if (extract) {
-        return { content: extract, status: "success" };
+      const apiExtract = await fetchWikipediaExtract(title, maxLength);
+      if (apiExtract) {
+        return { content: apiExtract, status: "success" };
       }
     }
   }
@@ -380,6 +453,7 @@ export async function extractPageContent(
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 
+    // Remove noise before parsing
     const removeSelectors = [
       "script", "style", "nav", "header", "footer", "aside",
       "[class*='ad']", "[class*='advertisement']",
@@ -392,7 +466,11 @@ export async function extractPageContent(
       if (sel) doc.querySelectorAll(sel).forEach((el) => el.remove());
     });
 
+    // Find the best content container
     let contentEl: Element | null =
+      doc.querySelector("#mw-content-text .mw-parser-output") ||
+      doc.querySelector("#mw-content-text") ||
+      doc.querySelector(".mw-parser-output") ||
       doc.querySelector("article") ||
       doc.querySelector("main") ||
       doc.querySelector('[role="main"]') ||
@@ -410,11 +488,10 @@ export async function extractPageContent(
       return { content: "", status: "error", error: "No content found" };
     }
 
-    let text = contentEl.textContent || "";
-    text = cleanExtractedText(text);
+    const text = extractStructuredText(contentEl, maxLength);
 
     if (maxLength > 0 && text.length > maxLength) {
-      text = text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`;
+      return { content: text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`, status: "success" };
     }
 
     console.log("[Web Search] Extracted:", text.length, "chars from", url);
@@ -426,7 +503,7 @@ export async function extractPageContent(
   }
 }
 
-// ========== QUERY REWRITING (conversational → search keywords) ==========
+// ========== QUERY REWRITING ==========
 
 export interface RewriteQueryOptions {
   apiUrl: string;
@@ -435,31 +512,15 @@ export interface RewriteQueryOptions {
   currentInput: string;
 }
 
-/**
- * Desperate fallback: grab the last 3–4 words of the user's prompt.
- * Better than sending a 50-word conversational string to a search engine.
- */
 function lastWordsFallback(input: string): string {
   const words = input.trim().split(/\s+/).filter((w) => w.length > 0);
   if (words.length <= 4) return input.trim();
   return words.slice(-4).join(" ");
 }
 
-/**
- * Calls local Ollama (/api/chat, stream: false) to rewrite a conversational
- * query into concise search keywords.
- *
- * Returns:
- *   - string  → rewritten search query
- *   - null    → LLM explicitly said NO_SEARCH
- *
- * On ANY failure this NEVER throws. It falls back to lastWordsFallback().
- */
 export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<string | null> {
   const { apiUrl, model, messages, currentInput } = options;
 
-  // Inject recent chat history as message pairs so the model can resolve
-  // anaphoric references ("explain that", "the second point", etc.)
   const historyMessages = messages.slice(-4).map((m) => ({
     role: m.role as "user" | "assistant" | "system",
     content: m.content,
@@ -495,8 +556,6 @@ export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<
     }
 
     const data = await res.json();
-
-    // /api/chat with stream:false returns { message: { role:"assistant", content:"..." }, done: true }
     raw = String(data.message?.content ?? "").trim();
 
     const elapsed = Math.round(performance.now() - start);
@@ -507,20 +566,17 @@ export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<
     return lastWordsFallback(currentInput);
   }
 
-  // NO_SEARCH guard
   if (!raw || raw.toUpperCase() === "NO_SEARCH") {
     console.log("[Web Search] Rewriter returned NO_SEARCH");
     return null;
   }
 
-  // Clean up: remove quotes, markdown, extra whitespace
   let cleaned = raw
     .replace(/^["'`]+|["'`]+$/g, "")
     .replace(/\*\*|__|`/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
-  // If still empty after cleanup, fallback to last words
   if (!cleaned || cleaned.length < 2) {
     console.log("[Web Search] Rewriter returned empty after cleanup, using word fallback");
     return lastWordsFallback(currentInput);
@@ -534,21 +590,68 @@ export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<
 export async function searchWithContent(
   query: string,
   limit: number = 5,
-  includeContent: boolean = true
+  includeContent: boolean = true,
+  rewriterOptions?: RewriteQueryOptions
 ): Promise<SearchResponse> {
   const startTime = Date.now();
   console.log("[Web Search] ========== Starting search for:", query);
 
+  // ------------------------------------------------------------------
+  // 1. URL BYPASS: if the query contains a direct URL, fetch it directly
+  // ------------------------------------------------------------------
+  const directUrl = extractUrlFromQuery(query);
+  if (directUrl) {
+    console.log("[Web Search] Direct URL detected:", directUrl);
+    const extracted = await extractPageContent(directUrl, 12000);
+
+    return {
+      results: [
+        {
+          title: "Direct Source",
+          url: directUrl,
+          description: extracted.content.substring(0, 300),
+          fullContent: extracted.content,
+          fetchStatus: extracted.status,
+          error: extracted.error,
+        },
+      ],
+      totalResults: 1,
+      engine: "direct-url",
+      status: `Direct URL fetch; ${extracted.content.length} chars; ${extracted.status}`,
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // 2. QUERY REWRITING: conversational → standalone search keywords
+  // ------------------------------------------------------------------
+  let searchQuery = query;
+  if (rewriterOptions) {
+    const rewritten = await rewriteSearchQuery(rewriterOptions);
+    if (rewritten === null) {
+      console.log("[Web Search] Rewriter says NO_SEARCH, skipping web search");
+      return {
+        results: [],
+        totalResults: 0,
+        engine: "none",
+        status: "NO_SEARCH",
+      };
+    }
+    searchQuery = rewritten;
+    console.log("[Web Search] Original:", query, "→ Rewritten:", searchQuery);
+  }
+
+  // ------------------------------------------------------------------
+  // 3. SEARCH ENGINES: API-based first, then HTML scraping fallback
+  // ------------------------------------------------------------------
   let results: SearchResult[] = [];
   let engine = "";
   const errors: string[] = [];
 
-  // Priority: API-based first (reliable), then HTML scraping (fallback)
   const engines = [
-    { name: "DuckDuckGo API", fn: () => searchDuckDuckGoAPI(query, Math.min(limit * 2 + 2, 10)) },
-    { name: "Wikipedia", fn: () => searchWikipedia(query, Math.min(limit * 2 + 2, 10)) },
-    { name: "Bing", fn: () => searchBing(query, Math.min(limit * 2 + 2, 10)) },
-    { name: "DuckDuckGo Lite", fn: () => searchDuckDuckGoLite(query, Math.min(limit * 2 + 2, 10)) },
+    { name: "DuckDuckGo API", fn: () => searchDuckDuckGoAPI(searchQuery, Math.min(limit * 2 + 2, 10)) },
+    { name: "Wikipedia", fn: () => searchWikipedia(searchQuery, Math.min(limit * 2 + 2, 10)) },
+    { name: "Bing", fn: () => searchBing(searchQuery, Math.min(limit * 2 + 2, 10)) },
+    { name: "DuckDuckGo Lite", fn: () => searchDuckDuckGoLite(searchQuery, Math.min(limit * 2 + 2, 10)) },
   ];
 
   for (const eng of engines) {
@@ -592,7 +695,7 @@ export async function searchWithContent(
       return {
         ...result,
         fullContent: extracted.content,
-        fetchStatus: extracted.status as "success" | "error",
+        fetchStatus: extracted.status,
         error: extracted.error,
       };
     });
