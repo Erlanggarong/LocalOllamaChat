@@ -1,10 +1,9 @@
 /**
  * Multi-engine web search with content extraction.
  *
- * Primary approach: API-based search (DuckDuckGo Instant Answer + Wikipedia).
- * These are official/free APIs with no bot detection and JSON responses.
- *
- * Fallback: HTML scraping via custom Rust reqwest command.
+ * All HTTP requests go through a custom Rust backend command (reqwest)
+ * to bypass CORS/bot-detection entirely. Parsing uses resilient,
+ * generic selectors instead of brittle class names.
  */
 
 import { invoke } from "@tauri-apps/api/tauri";
@@ -37,18 +36,95 @@ async function rustFetch(url: string): Promise<{ status: number; body: string }>
   return { status: res.status, body: res.body };
 }
 
-// ========== API-BASED SEARCH ENGINES (Primary) ==========
+function logRaw(label: string, body: string, maxLen = 2000) {
+  const preview = body.substring(0, maxLen).replace(/\s+/g, " ").trim();
+  console.log(`[Web Search] Raw ${label} (${body.length} chars):`, preview);
+}
 
-/**
- * DuckDuckGo Instant Answer API — official, free, JSON.
- * https://duckduckgo.com/api
- */
+// ========== 1. WIKIPEDIA API (JSON) ==========
+
+async function searchWikipedia(query: string, limit: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying Wikipedia API...");
+  const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${limit}&format=json&utf8=1&redirects=1`;
+
+  const { status, body } = await rustFetch(url);
+  console.log("[Web Search] Wikipedia status:", status);
+  logRaw("Wikipedia", body, 1500);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!body || body.length < 50) throw new Error("Empty response");
+
+  let data: any;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error("Invalid JSON");
+  }
+
+  // Check for API-level errors
+  if (data.error) {
+    throw new Error(`Wikipedia API error: ${data.error.info || JSON.stringify(data.error)}`);
+  }
+
+  const searchResults = data?.query?.search;
+  if (!Array.isArray(searchResults)) {
+    console.log("[Web Search] Wikipedia unexpected structure keys:", Object.keys(data));
+    throw new Error("Unexpected JSON structure: query.search missing");
+  }
+
+  console.log("[Web Search] Wikipedia raw results count:", searchResults.length);
+
+  const results: SearchResult[] = [];
+  for (const item of searchResults.slice(0, limit)) {
+    const title = item.title;
+    if (!title) continue;
+    const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
+    const snippet = (item.snippet || "")
+      .replace(/<[^>]+>/g, "") // strip HTML tags
+      .replace(/&quot;/g, '"')
+      .replace(/&#039;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">");
+
+    console.log("[Web Search] Wikipedia candidate:", title, "|", snippet.substring(0, 80));
+    results.push({ title, url, description: snippet });
+  }
+
+  console.log("[Web Search] Wikipedia parsed:", results.length);
+  return results;
+}
+
+async function fetchWikipediaExtract(title: string, maxLength: number): Promise<string> {
+  const url = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(title)}&format=json&utf8=1`;
+  const { status, body } = await rustFetch(url);
+  if (status < 200 || status >= 300 || !body) return "";
+
+  try {
+    const data = JSON.parse(body);
+    const pages = data?.query?.pages || {};
+    for (const pageId in pages) {
+      const extract = pages[pageId]?.extract || "";
+      if (maxLength > 0 && extract.length > maxLength) {
+        return extract.substring(0, maxLength) + "\n\n[Content truncated]";
+      }
+      return extract;
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+// ========== 2. DUCKDUCKGO INSTANT ANSWER API (JSON) ==========
+
 async function searchDuckDuckGoAPI(query: string, limit: number): Promise<SearchResult[]> {
   console.log("[Web Search] Trying DuckDuckGo Instant Answer API...");
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=mykizo`;
 
   const { status, body } = await rustFetch(url);
   console.log("[Web Search] DDG API status:", status);
+  logRaw("DDG API", body, 1500);
 
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!body || body.length < 50) throw new Error("Empty response");
@@ -69,6 +145,7 @@ async function searchDuckDuckGoAPI(query: string, limit: number): Promise<Search
       url: data.AbstractURL,
       description: data.AbstractText,
     });
+    console.log("[Web Search] DDG API abstract:", data.Heading, "|", data.AbstractText.substring(0, 80));
   }
 
   // Related topics
@@ -82,7 +159,6 @@ async function searchDuckDuckGoAPI(query: string, limit: number): Promise<Search
         description: topic.Text,
       });
     }
-    // Nested topics (sometimes DDG groups them)
     if (topic.Topics) {
       for (const sub of topic.Topics) {
         if (results.length >= limit) break;
@@ -97,9 +173,8 @@ async function searchDuckDuckGoAPI(query: string, limit: number): Promise<Search
     }
   }
 
-  // Results array (if present)
-  const resultList = data.Results || [];
-  for (const r of resultList) {
+  // Results array
+  for (const r of data.Results || []) {
     if (results.length >= limit) break;
     if (r.Text && r.FirstURL) {
       results.push({
@@ -114,107 +189,126 @@ async function searchDuckDuckGoAPI(query: string, limit: number): Promise<Search
   return results;
 }
 
-/**
- * Wikipedia Search API — very reliable, no bot detection.
- */
-async function searchWikipedia(query: string, limit: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying Wikipedia API...");
-  const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${limit}&format=json&origin=*`;
-
-  const { status, body } = await rustFetch(searchUrl);
-  console.log("[Web Search] Wikipedia search status:", status);
-
-  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
-  if (!body) throw new Error("Empty response");
-
-  let data: any;
-  try {
-    data = JSON.parse(body);
-  } catch {
-    throw new Error("Invalid JSON");
-  }
-
-  const searchResults = data?.query?.search || [];
-  const results: SearchResult[] = [];
-
-  for (const item of searchResults.slice(0, limit)) {
-    const title = item.title;
-    const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
-    const snippet = (item.snippet || "")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&quot;/g, '"')
-      .replace(/&#039;/g, "'")
-      .replace(/&amp;/g, "&");
-
-    results.push({ title, url, description: snippet });
-  }
-
-  console.log("[Web Search] Wikipedia parsed:", results.length);
-  return results;
-}
+// ========== 3. GENERIC HTML SCRAPING (resilient, no brittle classes) ==========
 
 /**
- * Fetch Wikipedia lead section (before first heading) for a given title.
+ * Generic search-result extractor from HTML.
+ * Instead of relying on obfuscated class names, we look for structural patterns:
+ *  - <li> elements containing an <a> with an external URL
+ *  - Nearby <p> or <div> with substantial text for the description
  */
-async function fetchWikipediaExtract(title: string, maxLength: number): Promise<string> {
-  const url = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(title)}&format=json&origin=*`;
-  const { status, body } = await rustFetch(url);
-  if (status < 200 || status >= 300 || !body) return "";
-
-  try {
-    const data = JSON.parse(body);
-    const pages = data?.query?.pages || {};
-    for (const pageId in pages) {
-      const extract = pages[pageId]?.extract || "";
-      if (maxLength > 0 && extract.length > maxLength) {
-        return extract.substring(0, maxLength) + "\n\n[Content truncated]";
-      }
-      return extract;
-    }
-  } catch {
-    // ignore
-  }
-  return "";
-}
-
-// ========== FALLBACK: HTML SCRAPING ==========
-
-async function searchDuckDuckGoLite(query: string, numResults: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying DuckDuckGo Lite (fallback)...");
-  const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}&kl=us-en`;
-
-  const { status, body: html } = await rustFetch(url);
-  console.log("[Web Search] DDG Lite status:", status, "length:", html?.length || 0);
-
-  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
-  if (!html || html.length < 200) throw new Error("Empty/blocked response");
-
+function extractResultsFromHtml(
+  html: string,
+  numResults: number,
+  engineName: string
+): SearchResult[] {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
+
   const results: SearchResult[] = [];
+  const seenUrls = new Set<string>();
 
-  const rows = doc.querySelectorAll("table tbody tr");
-  rows.forEach((row) => {
-    if (results.length >= numResults) return;
-    const linkEl = row.querySelector("a.result-link") as HTMLAnchorElement | null;
-    const snippetEl = row.querySelector(".result-snippet");
-    if (!linkEl) return;
-    const title = linkEl.textContent?.trim() || "";
-    const href = linkEl.getAttribute("href") || "";
-    const snippet = snippetEl?.textContent?.trim() || "";
-    let url = href;
-    if (href.startsWith("/")) url = `https://lite.duckduckgo.com${href}`;
-    if (title && url && snippet && url.startsWith("http") && !url.includes("duckduckgo")) {
-      results.push({ title, url, description: snippet });
+  // Strategy 1: Look for <li> or <div> containers that have both a link and text
+  const containers = doc.querySelectorAll("li, div, article");
+  console.log(`[Web Search] ${engineName} scanning ${containers.length} containers...`);
+
+  for (const container of Array.from(containers)) {
+    if (results.length >= numResults) break;
+
+    // Find the primary link in this container
+    const links = container.querySelectorAll("a[href]");
+    let bestLink: HTMLAnchorElement | null = null;
+
+    for (const link of Array.from(links)) {
+      const a = link as HTMLAnchorElement;
+      const href = a.getAttribute("href") || "";
+      const text = (a.textContent || "").trim();
+
+      // Skip internal/navigation links
+      if (!href.startsWith("http")) continue;
+      if (href.includes("bing.com") || href.includes("duckduckgo.com") || href.includes("microsoft.com")) continue;
+      if (text.length < 3) continue;
+
+      // Prefer links inside headings (h2, h3)
+      const parentTag = a.parentElement?.tagName.toLowerCase() || "";
+      const grandparentTag = a.parentElement?.parentElement?.tagName.toLowerCase() || "";
+      if (parentTag === "h2" || parentTag === "h3" || grandparentTag === "h2" || grandparentTag === "h3") {
+        bestLink = a;
+        break;
+      }
+      // Otherwise pick the first valid one
+      if (!bestLink) bestLink = a;
     }
-  });
 
-  console.log("[Web Search] DDG Lite parsed:", results.length);
+    if (!bestLink) continue;
+
+    const url = bestLink.getAttribute("href") || "";
+    const title = (bestLink.textContent || "").trim();
+
+    if (!url || !title || seenUrls.has(url)) continue;
+
+    // Find description: look for <p> or text-rich <div> inside same container
+    let description = "";
+    const textEls = container.querySelectorAll("p, span, div");
+    for (const el of Array.from(textEls)) {
+      const txt = (el.textContent || "").trim();
+      // Must be substantial, and NOT just the title repeated
+      if (txt.length > 20 && txt !== title && !txt.includes(title)) {
+        description = txt;
+        break;
+      }
+    }
+
+    // Fallback: if no <p> found, try the container's own text minus the link text
+    if (!description) {
+      const containerText = (container.textContent || "").replace(title, "").trim();
+      if (containerText.length > 20) {
+        description = containerText.substring(0, 300);
+      }
+    }
+
+    if (description) {
+      console.log(`[Web Search] ${engineName} candidate: "${title.substring(0, 60)}..." | ${url.substring(0, 60)}... | desc:${description.substring(0, 80)}...`);
+      seenUrls.add(url);
+      results.push({ title, url, description: description.substring(0, 500) });
+    }
+  }
+
+  // Strategy 2: If still nothing, scan ALL <a> tags with external URLs
+  if (results.length === 0) {
+    console.log(`[Web Search] ${engineName} fallback: scanning all <a> tags...`);
+    const allLinks = doc.querySelectorAll("a[href^='http']");
+    for (const link of Array.from(allLinks)) {
+      if (results.length >= numResults) break;
+      const a = link as HTMLAnchorElement;
+      const href = a.getAttribute("href") || "";
+      const text = (a.textContent || "").trim();
+
+      if (href.includes("bing.com") || href.includes("duckduckgo.com")) continue;
+      if (text.length < 5 || text.length > 200) continue;
+      if (seenUrls.has(href)) continue;
+
+      // Look for a nearby sibling/parent text node as description
+      let description = "";
+      let sibling = a.parentElement?.nextElementSibling;
+      if (sibling) {
+        description = (sibling.textContent || "").trim();
+      }
+      if (!description && a.parentElement) {
+        description = (a.parentElement.textContent || "").replace(text, "").trim();
+      }
+
+      seenUrls.add(href);
+      results.push({ title: text, url: href, description: description.substring(0, 500) || text });
+    }
+  }
+
+  console.log(`[Web Search] ${engineName} total extracted:`, results.length);
   return results;
 }
 
 async function searchBing(query: string, numResults: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying Bing (fallback)...");
+  console.log("[Web Search] Trying Bing (generic parser)...");
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${numResults}&setmkt=en-US&setlang=en`;
 
   const { status, body: html } = await rustFetch(url);
@@ -223,26 +317,22 @@ async function searchBing(query: string, numResults: number): Promise<SearchResu
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!html || html.length < 200) throw new Error("Empty/blocked response");
 
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-  const results: SearchResult[] = [];
+  logRaw("Bing HTML", html, 2000);
+  return extractResultsFromHtml(html, numResults, "Bing");
+}
 
-  const resultElements = doc.querySelectorAll(".b_algo");
-  resultElements.forEach((el, idx) => {
-    if (idx >= numResults) return;
-    const linkEl = el.querySelector("h2 a") as HTMLAnchorElement | null;
-    const snippetEl = el.querySelector("p, .b_caption p");
-    const title = linkEl?.textContent?.trim();
-    let url = linkEl?.getAttribute("href") || "";
-    const snippet = snippetEl?.textContent?.trim();
-    if (url && url.startsWith("/")) url = `https://www.bing.com${url}`;
-    if (title && url && snippet && url.startsWith("http")) {
-      results.push({ title, url, description: snippet });
-    }
-  });
+async function searchDuckDuckGoLite(query: string, numResults: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying DuckDuckGo Lite (generic parser)...");
+  const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}&kl=us-en`;
 
-  console.log("[Web Search] Bing parsed:", results.length);
-  return results;
+  const { status, body: html } = await rustFetch(url);
+  console.log("[Web Search] DDG Lite status:", status, "length:", html?.length || 0);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!html || html.length < 200) throw new Error("Empty/blocked response");
+
+  logRaw("DDG Lite HTML", html, 2000);
+  return extractResultsFromHtml(html, numResults, "DDG Lite");
 }
 
 // ========== CONTENT EXTRACTION ==========
@@ -263,7 +353,7 @@ export async function extractPageContent(
     return { content: "", status: "error", error: "PDF files not supported" };
   }
 
-  // Special case: Wikipedia — use API instead of scraping
+  // Wikipedia: use API instead of scraping
   if (url.includes("wikipedia.org") || url.includes("wikimedia.org")) {
     const titleMatch = url.match(/wiki\/(.+)$/);
     if (titleMatch) {
@@ -290,8 +380,6 @@ export async function extractPageContent(
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 
-    const isWikipedia = url.includes("wikipedia.org") || url.includes("wikimedia.org");
-
     const removeSelectors = [
       "script", "style", "nav", "header", "footer", "aside",
       "[class*='ad']", "[class*='advertisement']",
@@ -299,25 +387,12 @@ export async function extractPageContent(
       "[class*='cookie']", "[class*='popup']",
       "[id*='ad']", "[id*='sidebar']", "[id*='cookie']",
       "iframe", "noscript", "svg", "canvas",
-      isWikipedia ? ".infobox" : "",
-      isWikipedia ? ".toc" : "",
-      isWikipedia ? ".navbox" : "",
-      isWikipedia ? ".catlinks" : "",
-      isWikipedia ? ".mw-editsection" : "",
-      isWikipedia ? ".mw-jump-link" : "",
-      isWikipedia ? ".reflist" : "",
-      isWikipedia ? ".reference" : "",
-      isWikipedia ? ".thumbinner" : "",
-      isWikipedia ? ".image" : "",
-    ].filter(Boolean);
-
+    ];
     removeSelectors.forEach((sel) => {
       if (sel) doc.querySelectorAll(sel).forEach((el) => el.remove());
     });
 
     let contentEl: Element | null =
-      (isWikipedia ? doc.querySelector("#mw-content-text") : null) ||
-      (isWikipedia ? doc.querySelector(".mw-parser-output") : null) ||
       doc.querySelector("article") ||
       doc.querySelector("main") ||
       doc.querySelector('[role="main"]') ||
@@ -325,8 +400,6 @@ export async function extractPageContent(
       doc.querySelector("#content") ||
       doc.querySelector("#main-content") ||
       doc.querySelector(".main-content") ||
-      doc.querySelector(".post") ||
-      doc.querySelector(".entry") ||
       doc.querySelector(".post-content") ||
       doc.querySelector(".entry-content") ||
       doc.querySelector("[class*='article']") ||
@@ -337,33 +410,8 @@ export async function extractPageContent(
       return { content: "", status: "error", error: "No content found" };
     }
 
-    let text = "";
-    if (isWikipedia) {
-      const children = Array.from(contentEl.children);
-      const leadParts: string[] = [];
-      for (const child of children) {
-        const tag = child.tagName.toLowerCase();
-        if (tag === "h2" || tag === "h3" || tag === "section") break;
-        if (["div", "table", "ul", "ol"].includes(tag)) {
-          if (child.querySelector("p")) {
-            leadParts.push(child.textContent || "");
-          }
-          continue;
-        }
-        leadParts.push(child.textContent || "");
-      }
-      text = leadParts.join("\n\n");
-    }
-
-    if (!text.trim()) {
-      text = contentEl.textContent || "";
-    }
-
+    let text = contentEl.textContent || "";
     text = cleanExtractedText(text);
-
-    if (isWikipedia) {
-      text = text.replace(/Categories?:\s*.*/gi, "").trim();
-    }
 
     if (maxLength > 0 && text.length > maxLength) {
       text = text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`;
@@ -396,8 +444,8 @@ export async function searchWithContent(
   const engines = [
     { name: "DuckDuckGo API", fn: () => searchDuckDuckGoAPI(query, Math.min(limit * 2 + 2, 10)) },
     { name: "Wikipedia", fn: () => searchWikipedia(query, Math.min(limit * 2 + 2, 10)) },
-    { name: "DuckDuckGo Lite", fn: () => searchDuckDuckGoLite(query, Math.min(limit * 2 + 2, 10)) },
     { name: "Bing", fn: () => searchBing(query, Math.min(limit * 2 + 2, 10)) },
+    { name: "DuckDuckGo Lite", fn: () => searchDuckDuckGoLite(query, Math.min(limit * 2 + 2, 10)) },
   ];
 
   for (const eng of engines) {
