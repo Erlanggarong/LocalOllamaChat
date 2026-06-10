@@ -1,12 +1,18 @@
 /**
  * Multi-engine web search with full page content extraction.
  * Inspired by web-search-mcp (https://github.com/mrkrsl/web-search-mcp)
- * Ported for browser use without Playwright.
  *
- * Uses Tauri's HTTP API to bypass WebView CORS/SSL restrictions.
+ * Uses a custom Rust backend command (reqwest) instead of the browser fetch
+ * or Tauri's built-in HTTP API. This bypasses all CORS, SSL, and bot-detection
+ * issues because requests originate from the native Rust layer.
  */
 
-import { fetch as tauriFetch, ResponseType } from "@tauri-apps/api/http";
+import { invoke } from "@tauri-apps/api/tauri";
+
+interface FetchResponse {
+  status: number;
+  body: string;
+}
 
 export interface SearchResult {
   title: string;
@@ -24,19 +30,68 @@ export interface SearchResponse {
   status: string;
 }
 
+async function tauriGet(url: string, _referer?: string): Promise<{ status: number; data: string }> {
+  // Use custom Rust command instead of Tauri's built-in HTTP API.
+  // The Rust backend uses reqwest which is much more reliable for web scraping.
+  const res = await invoke<FetchResponse>("fetch_url", { url });
+  return { status: res.status, data: res.body };
+}
+
 // ========== SEARCH ENGINES ==========
 
-async function searchDuckDuckGo(query: string, numResults: number): Promise<SearchResult[]> {
-  const res = await tauriFetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-    responseType: ResponseType.Text,
-    timeout: 8000,
+async function searchDuckDuckGoLite(query: string, numResults: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying DuckDuckGo Lite...");
+  const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}&kl=us-en`;
+
+  const { status, data: html } = await tauriGet(url, "https://lite.duckduckgo.com/");
+  console.log("[Web Search] DDG Lite status:", status, "length:", html?.length || 0);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!html || html.length < 200) throw new Error("Empty/blocked response");
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  const results: SearchResult[] = [];
+
+  // DuckDuckGo Lite structure: results in table rows
+  const rows = doc.querySelectorAll("table tbody tr");
+  rows.forEach((row) => {
+    if (results.length >= numResults) return;
+    const linkEl = row.querySelector("a.result-link") as HTMLAnchorElement | null;
+    const snippetEl = row.querySelector(".result-snippet");
+    if (!linkEl) return;
+
+    const title = linkEl.textContent?.trim() || "";
+    const href = linkEl.getAttribute("href") || "";
+    const snippet = snippetEl?.textContent?.trim() || "";
+
+    // Resolve relative redirects
+    let url = href;
+    if (href.startsWith("/")) {
+      url = `https://lite.duckduckgo.com${href}`;
+    } else if (href.startsWith("javascript:")) {
+      return; // skip JS links
+    }
+
+    if (title && url && snippet && url.startsWith("http")) {
+      results.push({ title, url, description: snippet });
+    }
   });
-  if (res.status < 200 || res.status >= 300) throw new Error("DuckDuckGo search failed: " + res.status);
-  const html = res.data as string;
+
+  console.log("[Web Search] DDG Lite parsed:", results.length);
+  return results;
+}
+
+async function searchDuckDuckGoHtml(query: string, numResults: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying DuckDuckGo HTML...");
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=us-en`;
+
+  const { status, data: html } = await tauriGet(url, "https://html.duckduckgo.com/");
+  console.log("[Web Search] DDG HTML status:", status, "length:", html?.length || 0);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!html || html.length < 200) throw new Error("Empty/blocked response");
 
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
@@ -49,36 +104,34 @@ async function searchDuckDuckGo(query: string, numResults: number): Promise<Sear
     const titleEl = el.querySelector(".result__a") as HTMLAnchorElement | null;
     const snippetEl = el.querySelector(".result__snippet");
     const title = titleEl?.textContent?.trim();
-    const url = titleEl?.href;
+    const url = titleEl?.getAttribute("href") || "";
     const snippet = snippetEl?.textContent?.trim();
     if (title && url && snippet) {
       results.push({ title, url, description: snippet });
     }
   });
 
+  console.log("[Web Search] DDG HTML parsed:", results.length);
   return results;
 }
 
 async function searchBing(query: string, numResults: number): Promise<SearchResult[]> {
-  const res = await tauriFetch(`https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${numResults}`, {
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "text/html",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    responseType: ResponseType.Text,
-    timeout: 8000,
-  });
-  if (res.status < 200 || res.status >= 300) throw new Error("Bing search failed: " + res.status);
-  const html = res.data as string;
+  console.log("[Web Search] Trying Bing...");
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${numResults}&setmkt=en-US&setlang=en`;
+
+  const { status, data: html } = await tauriGet(url, "https://www.bing.com/");
+  console.log("[Web Search] Bing status:", status, "length:", html?.length || 0);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!html || html.length < 200) throw new Error("Empty/blocked response");
 
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
 
   const results: SearchResult[] = [];
-  const selectors = ["[data-bing-meta] li.b_algo", ".b_algo", "#b_content .b_algo", ".results li"];
 
+  // Bing result selectors
+  const selectors = [".b_algo", "[data-bing-meta] li.b_algo", "#b_content .b_algo"];
   let resultElements: NodeListOf<Element> | null = null;
   for (const selector of selectors) {
     const els = doc.querySelectorAll(selector);
@@ -88,27 +141,113 @@ async function searchBing(query: string, numResults: number): Promise<SearchResu
     }
   }
 
-  if (!resultElements || resultElements.length === 0) {
-    resultElements = doc.querySelectorAll('li:has(h2 a), .result, [class*="result"]');
-  }
-
-  resultElements.forEach((el, idx) => {
+  resultElements?.forEach((el, idx) => {
     if (idx >= numResults) return;
-    const linkEl = el.querySelector("h2 a, .b_attribution a, a[href]") as HTMLAnchorElement | null;
-    const snippetEl = el.querySelector("p, .b_caption p, [class*='snippet'], [class*='content']");
+    const linkEl = el.querySelector("h2 a") as HTMLAnchorElement | null;
+    const snippetEl = el.querySelector("p, .b_caption p");
     const title = linkEl?.textContent?.trim();
-    let url = linkEl?.href;
+    let url = linkEl?.getAttribute("href") || "";
     const snippet = snippetEl?.textContent?.trim();
 
-    if (url && url.startsWith("/")) {
-      url = `https://www.bing.com${url}`;
-    }
+    if (url && url.startsWith("/")) url = `https://www.bing.com${url}`;
 
     if (title && url && snippet && url.startsWith("http")) {
       results.push({ title, url, description: snippet });
     }
   });
 
+  console.log("[Web Search] Bing parsed:", results.length);
+  return results;
+}
+
+async function searchSearXNG(query: string, numResults: number): Promise<SearchResult[]> {
+  // Try multiple public SearXNG instances
+  const instances = [
+    "https://search.sapti.me",
+    "https://search.bus-hit.me",
+    "https://searx.be",
+  ];
+
+  for (const instance of instances) {
+    try {
+      console.log("[Web Search] Trying SearXNG:", instance);
+      const url = `${instance}/search?q=${encodeURIComponent(query)}&format=json&language=en`;
+
+      const { status, data: text } = await tauriGet(url, instance);
+      console.log("[Web Search] SearXNG status:", status, "length:", text?.length || 0);
+
+      if (status < 200 || status >= 300) continue;
+      if (!text || text.length < 50) continue;
+
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        continue;
+      }
+
+      const rawResults = json.results || [];
+      const results: SearchResult[] = [];
+      rawResults.slice(0, numResults).forEach((r: any) => {
+        if (r.title && r.url) {
+          results.push({
+            title: r.title,
+            url: r.url,
+            description: r.content || r.abstract || "",
+          });
+        }
+      });
+
+      if (results.length > 0) {
+        console.log("[Web Search] SearXNG success:", results.length);
+        return results;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "failed";
+      console.log("[Web Search] SearXNG failed:", msg);
+    }
+  }
+
+  throw new Error("All SearXNG instances failed");
+}
+
+async function searchWikipedia(query: string, numResults: number): Promise<SearchResult[]> {
+  console.log("[Web Search] Trying Wikipedia API...");
+  // Wikipedia search API (very reliable, no bot detection)
+  const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${numResults}&format=json&origin=*`;
+
+  const { status, data: text } = await tauriGet(searchUrl, "https://en.wikipedia.org/");
+  console.log("[Web Search] Wikipedia search status:", status);
+
+  if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+  if (!text) throw new Error("Empty response");
+
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error("Invalid JSON");
+  }
+
+  const searchResults = json?.query?.search || [];
+  const results: SearchResult[] = [];
+
+  for (const item of searchResults.slice(0, numResults)) {
+    const title = item.title;
+    const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
+    // Strip wiki markup from snippet
+    const snippet = (item.snippet || "")
+      .replace(/<span[^>]*>/g, "")
+      .replace(/<\/span>/g, "")
+      .replace(/&quot;/g, '"')
+      .replace(/&#039;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/<[^>]+>/g, "");
+
+    results.push({ title, url, description: snippet });
+  }
+
+  console.log("[Web Search] Wikipedia parsed:", results.length);
   return results;
 }
 
@@ -131,26 +270,21 @@ export async function extractPageContent(
   }
 
   try {
-    const res = await tauriFetch(url, {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      responseType: ResponseType.Text,
-      timeout: 8000,
-    });
+    console.log("[Web Search] Fetching content:", url);
+    const { status, data: html } = await tauriGet(url, "https://www.google.com/");
 
-    if (res.status < 200 || res.status >= 300) {
-      return { content: "", status: "error", error: `HTTP ${res.status}` };
+    console.log("[Web Search] Content status:", status, "length:", html?.length || 0);
+
+    if (status < 200 || status >= 300) {
+      return { content: "", status: "error", error: `HTTP ${status}` };
+    }
+    if (!html) {
+      return { content: "", status: "error", error: "Empty response" };
     }
 
-    const html = res.data as string;
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 
-    // Site-specific cleanup
     const isWikipedia = url.includes("wikipedia.org") || url.includes("wikimedia.org");
 
     const removeSelectors = [
@@ -160,7 +294,6 @@ export async function extractPageContent(
       "[class*='cookie']", "[class*='popup']",
       "[id*='ad']", "[id*='sidebar']", "[id*='cookie']",
       "iframe", "noscript", "svg", "canvas",
-      // Wikipedia-specific elements to remove
       isWikipedia ? ".infobox" : "",
       isWikipedia ? ".toc" : "",
       isWikipedia ? ".navbox" : "",
@@ -178,14 +311,11 @@ export async function extractPageContent(
     });
 
     let contentEl: Element | null =
-      // Wikipedia-specific
       (isWikipedia ? doc.querySelector("#mw-content-text") : null) ||
       (isWikipedia ? doc.querySelector(".mw-parser-output") : null) ||
-      // Generic semantic HTML
       doc.querySelector("article") ||
       doc.querySelector("main") ||
       doc.querySelector('[role="main"]') ||
-      // Common content containers
       doc.querySelector(".content") ||
       doc.querySelector("#content") ||
       doc.querySelector("#main-content") ||
@@ -202,19 +332,14 @@ export async function extractPageContent(
       return { content: "", status: "error", error: "No content found" };
     }
 
-    // For Wikipedia, extract only the lead section (before first h2 heading)
-    // This gives the most relevant summary and avoids huge tables/lists
     let text = "";
     if (isWikipedia) {
       const children = Array.from(contentEl.children);
       const leadParts: string[] = [];
       for (const child of children) {
         const tag = child.tagName.toLowerCase();
-        // Stop at first section heading
         if (tag === "h2" || tag === "h3" || tag === "section") break;
-        // Skip non-content elements
         if (["div", "table", "ul", "ol"].includes(tag)) {
-          // Only include if it looks like a paragraph container
           if (child.querySelector("p")) {
             leadParts.push(child.textContent || "");
           }
@@ -225,14 +350,12 @@ export async function extractPageContent(
       text = leadParts.join("\n\n");
     }
 
-    // Fallback to full content if lead section is empty
     if (!text.trim()) {
       text = contentEl.textContent || "";
     }
 
     text = cleanExtractedText(text);
 
-    // Remove Wikipedia category links at the bottom
     if (isWikipedia) {
       text = text.replace(/Categories?:\s*.*/gi, "").trim();
     }
@@ -241,9 +364,11 @@ export async function extractPageContent(
       text = text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`;
     }
 
+    console.log("[Web Search] Extracted:", text.length, "chars from", url);
     return { content: text, status: "success" };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("[Web Search] Content extraction failed:", url, message);
     return { content: "", status: "error", error: message };
   }
 }
@@ -256,32 +381,45 @@ export async function searchWithContent(
   includeContent: boolean = true
 ): Promise<SearchResponse> {
   const startTime = Date.now();
+  console.log("[Web Search] ========== Starting search for:", query);
 
   let results: SearchResult[] = [];
   let engine = "";
   const errors: string[] = [];
 
-  try {
-    const searchLimit = includeContent ? Math.min(limit * 2 + 2, 10) : limit;
-    results = await searchDuckDuckGo(query, searchLimit);
-    engine = "DuckDuckGo";
-  } catch (err) {
-    errors.push(`DuckDuckGo: ${err instanceof Error ? err.message : "failed"}`);
+  // Try engines in order
+  const engines = [
+    { name: "DuckDuckGo Lite", fn: () => searchDuckDuckGoLite(query, Math.min(limit * 2 + 2, 10)) },
+    { name: "DuckDuckGo HTML", fn: () => searchDuckDuckGoHtml(query, Math.min(limit * 2 + 2, 10)) },
+    { name: "Bing", fn: () => searchBing(query, Math.min(limit * 2 + 2, 10)) },
+    { name: "SearXNG", fn: () => searchSearXNG(query, Math.min(limit * 2 + 2, 10)) },
+    { name: "Wikipedia", fn: () => searchWikipedia(query, Math.min(limit * 2 + 2, 10)) },
+  ];
+
+  for (const eng of engines) {
     try {
-      const searchLimit = includeContent ? Math.min(limit * 2 + 2, 10) : limit;
-      results = await searchBing(query, searchLimit);
-      engine = "Bing";
-    } catch (err2) {
-      errors.push(`Bing: ${err2 instanceof Error ? err2.message : "failed"}`);
+      results = await eng.fn();
+      if (results.length > 0) {
+        engine = eng.name;
+        console.log("[Web Search] Success with", eng.name, "-", results.length, "results");
+        break;
+      }
+      console.log("[Web Search]", eng.name, "returned 0 results, trying next...");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "failed";
+      console.error("[Web Search]", eng.name, "failed:", msg);
+      errors.push(`${eng.name}: ${msg}`);
     }
   }
 
   if (results.length === 0) {
+    const status = `All search engines failed: ${errors.join("; ")}`;
+    console.error("[Web Search]", status);
     return {
       results: [],
       totalResults: 0,
       engine: "none",
-      status: `All search engines failed: ${errors.join("; ")}`,
+      status,
     };
   }
 
@@ -320,6 +458,8 @@ export async function searchWithContent(
     status += `; Extracted: ${successCount}; Failed: ${failedCount}`;
   }
   status += `; ${searchTime}ms`;
+
+  console.log("[Web Search] Final:", status);
 
   return {
     results: finalResults,

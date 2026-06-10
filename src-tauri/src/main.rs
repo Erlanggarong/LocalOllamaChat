@@ -8,6 +8,35 @@ use tauri::{AppHandle, GlobalWindowEvent, Manager, SystemTray, SystemTrayEvent, 
 
 struct OllamaProcess(Mutex<Option<Child>>);
 
+#[derive(serde::Serialize)]
+struct FetchResponse {
+    status: u16,
+    body: String,
+}
+
+#[tauri::command]
+async fn fetch_url(url: String) -> Result<FetchResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await.map_err(|e| format!("Failed to read body: {}", e))?;
+
+    Ok(FetchResponse { status, body })
+}
+
 fn main() {
     let tray_menu = tauri::SystemTrayMenu::new()
         .add_item(tauri::CustomMenuItem::new("show", "Show"))
@@ -50,6 +79,7 @@ fn main() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![fetch_url])
         .system_tray(tray)
         .on_system_tray_event(on_tray_event)
         .on_window_event(on_window_event)
