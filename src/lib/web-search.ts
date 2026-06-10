@@ -89,18 +89,25 @@ function formatList(listEl: Element, numbered: boolean): string {
   return items.join("\n");
 }
 
-function extractStructuredText(root: Element, maxLength: number): string {
+/**
+ * Recursively walks a DOM element and extracts all readable content.
+ * Tables are formatted with '|' separators.
+ * Lists are formatted as '- item' or 'N. item'.
+ * Headings, paragraphs, and leaf text nodes are captured.
+ * NO early exit — every element is processed so tables/lists deep in
+ * the page (e.g. Wikipedia country tables) are never skipped.
+ */
+function extractStructuredText(root: Element): string {
   const parts: string[] = [];
 
   function walk(el: Element) {
-    if (parts.join("\n").length > maxLength) return;
-
     const tag = el.tagName.toLowerCase();
 
     // Skip noise elements entirely
     const skipTags = [
       "script", "style", "nav", "header", "footer", "aside",
       "noscript", "svg", "canvas", "iframe", "form", "button",
+      "sup", "sub", "small", // tiny inline annotations
     ];
     if (skipTags.includes(tag)) return;
 
@@ -128,18 +135,27 @@ function extractStructuredText(root: Element, maxLength: number): string {
     // Handle paragraphs
     if (tag === "p") {
       const text = el.textContent?.trim();
-      if (text && text.length > 5) parts.push(text);
+      if (text && text.length > 3) parts.push(text);
       return;
     }
 
-    // For other elements with no element children, capture leaf text
-    if (el.children.length === 0) {
-      const text = el.textContent?.trim();
-      if (text && text.length > 10) parts.push(text);
+    // Inline text elements: capture text but also recurse into children
+    // (e.g. <div>text <b>bold</b> more</div>)
+    if (tag === "div" || tag === "section" || tag === "span" || tag === "a" || tag === "b" || tag === "i" || tag === "strong" || tag === "em") {
+      // If it has no element children, treat as leaf text
+      if (el.children.length === 0) {
+        const text = el.textContent?.trim();
+        if (text && text.length > 5) parts.push(text);
+        return;
+      }
+      // Otherwise recurse into children
+      for (const child of Array.from(el.children)) {
+        walk(child);
+      }
       return;
     }
 
-    // Recurse into container elements (div, section, span, etc.)
+    // For any other element, recurse into children
     for (const child of Array.from(el.children)) {
       walk(child);
     }
@@ -149,8 +165,12 @@ function extractStructuredText(root: Element, maxLength: number): string {
     walk(child);
   }
 
-  // Clean up excessive newlines
-  return parts.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+  // Clean up excessive newlines and empty parts
+  return parts
+    .filter((p) => p.trim().length > 0)
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 // ========== API-BASED SEARCH ENGINES ==========
@@ -268,27 +288,6 @@ async function searchWikipedia(query: string, limit: number): Promise<SearchResu
 
   console.log("[Web Search] Wikipedia parsed:", results.length);
   return results;
-}
-
-async function fetchWikipediaExtract(title: string, maxLength: number): Promise<string> {
-  const url = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(title)}&format=json&utf8=1`;
-  const { status, body } = await rustFetch(url);
-  if (status < 200 || status >= 300 || !body) return "";
-
-  try {
-    const data = JSON.parse(body);
-    const pages = data?.query?.pages || {};
-    for (const pageId in pages) {
-      const extract = pages[pageId]?.extract || "";
-      if (maxLength > 0 && extract.length > maxLength) {
-        return extract.substring(0, maxLength) + "\n\n[Content truncated]";
-      }
-      return extract;
-    }
-  } catch {
-    // ignore
-  }
-  return "";
 }
 
 // ========== HTML SCRAPING FALLBACKS ==========
@@ -426,18 +425,6 @@ export async function extractPageContent(
     return { content: "", status: "error", error: "PDF files not supported" };
   }
 
-  // Wikipedia: prefer API extract for the lead section, then supplement with structured HTML
-  if (url.includes("wikipedia.org") || url.includes("wikimedia.org")) {
-    const titleMatch = url.match(/wiki\/(.+)$/);
-    if (titleMatch) {
-      const title = decodeURIComponent(titleMatch[1]).replace(/_/g, " ");
-      const apiExtract = await fetchWikipediaExtract(title, maxLength);
-      if (apiExtract) {
-        return { content: apiExtract, status: "success" };
-      }
-    }
-  }
-
   try {
     console.log("[Web Search] Fetching content:", url);
     const { status, body: html } = await rustFetch(url);
@@ -488,7 +475,7 @@ export async function extractPageContent(
       return { content: "", status: "error", error: "No content found" };
     }
 
-    const text = extractStructuredText(contentEl, maxLength);
+    const text = extractStructuredText(contentEl);
 
     if (maxLength > 0 && text.length > maxLength) {
       return { content: text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`, status: "success" };
