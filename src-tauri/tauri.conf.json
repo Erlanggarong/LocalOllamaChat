@@ -1,0 +1,73 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:3000",
+    "distDir": "../dist",
+    "withGlobalTauri": false
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true,
+        "execute": true,
+        "sidecar": false,
+        "scope": [
+          {
+            "name": "ollama",
+            "cmd": "ollama",
+            "args": ["serve"]
+          }
+        ]
+      },
+      "window": {
+        "all": false,
+        "close": true,
+        "hide": true,
+        "show": true,
+        "maximize": false,
+        "minimize": false,
+        "unmaximize": false,
+        "unminimize": false,
+        "startDragging": false
+      },
+      "globalShortcut": {
+        "all": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.mykizo.desktop",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ]
+    },
+    "systemTray": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "resizable": true,
+        "title": "My Kizo",
+        "width": 840,
+        "height": 1350,
+        "minWidth": 400,
+        "minHeight": 600,
+        "visible": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}
