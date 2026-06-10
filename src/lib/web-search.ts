@@ -426,6 +426,97 @@ export async function extractPageContent(
   }
 }
 
+// ========== QUERY REWRITING (conversational → search keywords) ==========
+
+export interface RewriteQueryOptions {
+  apiUrl: string;
+  model: string;
+  messages: { role: string; content: string }[];
+  currentInput: string;
+}
+
+const REWRITER_SYSTEM_PROMPT = `You are a Search Query Generator. Your ONLY job is to convert the user's latest conversational input into a concise, standalone web search query.
+
+RULES:
+1. If the input refers to previous context (e.g., "explain that", "summarize above", "the second point", "what about it?"), rewrite it as a COMPLETE, self-contained search query using the provided chat history.
+2. If the input is already a clear standalone search query, return it as-is (cleaned up, max 12 words).
+3. If the input does NOT need a web search (e.g., "thank you", "ok", "hello", "I see", "great"), output EXACTLY: NO_SEARCH
+4. Output ONLY the search keywords. NO quotes, NO markdown, NO explanation, NO extra text.
+5. Maximum 12 words.`;
+
+/**
+ * Calls local Ollama to rewrite a conversational query into search keywords.
+ * Returns the rewritten query string, or null if the LLM says NO_SEARCH.
+ * On any error, throws so the caller can fall back to the original query.
+ */
+export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<string | null> {
+  const { apiUrl, model, messages, currentInput } = options;
+
+  // Build a compact history string from the last 3–4 turns (~6 messages)
+  const recentMessages = messages.slice(-6);
+  const historyText = recentMessages
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+    .join("\n");
+
+  const userPrompt = `CHAT HISTORY:
+${historyText || "(no previous messages)"}
+
+LATEST USER INPUT: ${currentInput}
+
+SEARCH QUERY:`;
+
+  const payload = {
+    model,
+    messages: [
+      { role: "system", content: REWRITER_SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+    stream: false,
+    options: {
+      temperature: 0.1,   // very deterministic
+      num_predict: 40,    // very short output
+      top_p: 0.5,
+    },
+  };
+
+  console.log("[Web Search] Rewriting query via Ollama...");
+  const start = performance.now();
+
+  const res = await fetch(apiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Ollama rewriter HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  const raw = (data.message?.content || data.response || "").trim();
+  const elapsed = Math.round(performance.now() - start);
+
+  console.log("[Web Search] Rewriter raw output (", elapsed, "ms):", raw);
+
+  // Handle NO_SEARCH
+  if (raw === "NO_SEARCH" || raw.toUpperCase() === "NO_SEARCH") {
+    return null;
+  }
+
+  // Clean up: remove quotes, markdown, extra whitespace
+  let cleaned = raw
+    .replace(/^["'`]+|["'`]+$/g, "") // surrounding quotes
+    .replace(/\*\*|__|`/g, "")       // markdown
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned || cleaned.length < 2) {
+    throw new Error("Rewriter returned empty string");
+  }
+
+  return cleaned;
+}
+
 // ========== MAIN SEARCH FUNCTION ==========
 
 export async function searchWithContent(

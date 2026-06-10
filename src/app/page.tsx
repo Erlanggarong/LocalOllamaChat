@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import MarkdownRenderer from "@/components/MarkdownRenderer";
 import DynamicBackground from "@/components/DynamicBackground";
-import { searchWithContent } from "@/lib/web-search";
+import { searchWithContent, rewriteSearchQuery } from "@/lib/web-search";
 
 interface MessageMetrics {
   evalCount?: number;
@@ -516,31 +516,59 @@ export default function ChatPage() {
     let webSearchContext = "";
     if (webSearchEnabled) {
       setIsSearchingWeb(true);
+      let searchQuery = userContent;
+      let skipSearch = false;
+
+      // Step 1: Rewrite conversational query into standalone search keywords
       try {
-        const searchResponse = await searchWithContent(userContent, 3, true);
-        setIsSearchingWeb(false);
-        console.log("[Web Search]", searchResponse.status);
-        if (searchResponse.results.length > 0) {
-          const formattedResults = searchResponse.results.map((r, idx) => {
-            let text = (idx + 1) + ". " + r.title + "\n" + "URL: " + r.url + "\n" + "Description: " + r.description;
-            if (r.fullContent && r.fullContent.trim()) {
-              text += "\n\nFull Content:\n" + r.fullContent;
-            }
-            return text;
-          });
-          let context = "Use the following web search results to help answer the user's query. Cite sources when appropriate. Focus on answering the user's specific question.\n\n" +
-            "Status: " + searchResponse.status + "\n\n" +
-            formattedResults.join("\n\n---\n\n") + "\n\n";
-          // Limit total web search context to avoid overflowing the model's context window
-          const MAX_WEB_CONTEXT = 12000;
-          if (context.length > MAX_WEB_CONTEXT) {
-            context = context.substring(0, MAX_WEB_CONTEXT) + "\n\n[Web search context truncated to avoid exceeding context window]\n\n";
-          }
-          webSearchContext = context;
+        const rewritten = await rewriteSearchQuery({
+          apiUrl,
+          model,
+          messages: messages.slice(-6),
+          currentInput: userContent,
+        });
+        if (rewritten === null) {
+          console.log("[Web Search] Rewriter says NO_SEARCH, skipping web search");
+          skipSearch = true;
+        } else {
+          searchQuery = rewritten;
+          console.log("[Web Search] Original:", userContent, "→ Rewritten:", searchQuery);
         }
       } catch (err) {
+        console.error("[Web Search] Query rewrite failed, using original:", err);
+        // fallback to original query
+      }
+
+      // Step 2: Execute search with (possibly rewritten) query
+      if (!skipSearch) {
+        try {
+          const searchResponse = await searchWithContent(searchQuery, 3, true);
+          setIsSearchingWeb(false);
+          console.log("[Web Search]", searchResponse.status);
+          if (searchResponse.results.length > 0) {
+            const formattedResults = searchResponse.results.map((r, idx) => {
+              let text = (idx + 1) + ". " + r.title + "\n" + "URL: " + r.url + "\n" + "Description: " + r.description;
+              if (r.fullContent && r.fullContent.trim()) {
+                text += "\n\nFull Content:\n" + r.fullContent;
+              }
+              return text;
+            });
+            let context = "Use the following web search results to help answer the user's query. Cite sources when appropriate. Focus on answering the user's specific question.\n\n" +
+              "Status: " + searchResponse.status + "\n\n" +
+              formattedResults.join("\n\n---\n\n") + "\n\n";
+            // Limit total web search context to avoid overflowing the model's context window
+            const MAX_WEB_CONTEXT = 12000;
+            if (context.length > MAX_WEB_CONTEXT) {
+              context = context.substring(0, MAX_WEB_CONTEXT) + "\n\n[Web search context truncated to avoid exceeding context window]\n\n";
+            }
+            webSearchContext = context;
+          }
+        } catch (err) {
+          setIsSearchingWeb(false);
+          console.error("Web search error:", err);
+        }
+      } else {
         setIsSearchingWeb(false);
-        console.error("Web search error:", err);
       }
     }
 
