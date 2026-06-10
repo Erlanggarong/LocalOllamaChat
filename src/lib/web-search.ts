@@ -2,7 +2,11 @@
  * Multi-engine web search with full page content extraction.
  * Inspired by web-search-mcp (https://github.com/mrkrsl/web-search-mcp)
  * Ported for browser use without Playwright.
+ *
+ * Uses Tauri's HTTP API to bypass WebView CORS/SSL restrictions.
  */
+
+import { fetch as tauriFetch, ResponseType } from "@tauri-apps/api/http";
 
 export interface SearchResult {
   title: string;
@@ -23,16 +27,16 @@ export interface SearchResponse {
 // ========== SEARCH ENGINES ==========
 
 async function searchDuckDuckGo(query: string, numResults: number): Promise<SearchResult[]> {
-  const res = await fetch(
-    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-    {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-    }
-  );
-  if (!res.ok) throw new Error("DuckDuckGo search failed");
-  const html = await res.text();
+  const res = await tauriFetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    },
+    responseType: ResponseType.Text,
+    timeout: 8000,
+  });
+  if (res.status < 200 || res.status >= 300) throw new Error("DuckDuckGo search failed: " + res.status);
+  const html = res.data as string;
 
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
@@ -56,18 +60,18 @@ async function searchDuckDuckGo(query: string, numResults: number): Promise<Sear
 }
 
 async function searchBing(query: string, numResults: number): Promise<SearchResult[]> {
-  const res = await fetch(
-    `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${numResults}`,
-    {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    }
-  );
-  if (!res.ok) throw new Error("Bing search failed");
-  const html = await res.text();
+  const res = await tauriFetch(`https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${numResults}`, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "text/html",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+    responseType: ResponseType.Text,
+    timeout: 8000,
+  });
+  if (res.status < 200 || res.status >= 300) throw new Error("Bing search failed: " + res.status);
+  const html = res.data as string;
 
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
@@ -127,26 +131,22 @@ export async function extractPageContent(
   }
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-
-    const res = await fetch(url, {
-      signal: controller.signal,
+    const res = await tauriFetch(url, {
+      method: "GET",
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
       },
+      responseType: ResponseType.Text,
+      timeout: 8000,
     });
-    clearTimeout(timeout);
 
-    if (!res.ok) {
+    if (res.status < 200 || res.status >= 300) {
       return { content: "", status: "error", error: `HTTP ${res.status}` };
     }
 
-    const html = await res.text();
+    const html = res.data as string;
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 

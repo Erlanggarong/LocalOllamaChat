@@ -33,6 +33,11 @@
         "unminimize": false,
         "startDragging": false
       },
+      "http": {
+        "all": true,
+        "request": true,
+        "scope": ["https://*/*", "http://*/*"]
+      },
       "globalShortcut": {
         "all": true
       }
