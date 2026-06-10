@@ -435,83 +435,112 @@ export interface RewriteQueryOptions {
   currentInput: string;
 }
 
-const REWRITER_SYSTEM_PROMPT = `You are a Search Query Generator. Your ONLY job is to convert the user's latest conversational input into a concise, standalone web search query.
-
-RULES:
-1. If the input refers to previous context (e.g., "explain that", "summarize above", "the second point", "what about it?"), rewrite it as a COMPLETE, self-contained search query using the provided chat history.
-2. If the input is already a clear standalone search query, return it as-is (cleaned up, max 12 words).
-3. If the input does NOT need a web search (e.g., "thank you", "ok", "hello", "I see", "great"), output EXACTLY: NO_SEARCH
-4. Output ONLY the search keywords. NO quotes, NO markdown, NO explanation, NO extra text.
-5. Maximum 12 words.`;
+/**
+ * Desperate fallback: grab the last 3–4 words of the user's prompt.
+ * Better than sending a 50-word conversational string to a search engine.
+ */
+function lastWordsFallback(input: string): string {
+  const words = input.trim().split(/\s+/).filter((w) => w.length > 0);
+  if (words.length <= 4) return input.trim();
+  return words.slice(-4).join(" ");
+}
 
 /**
- * Calls local Ollama to rewrite a conversational query into search keywords.
- * Returns the rewritten query string, or null if the LLM says NO_SEARCH.
- * On any error, throws so the caller can fall back to the original query.
+ * Calls local Ollama (/api/generate, stream: false) to rewrite a conversational
+ * query into concise search keywords.
+ *
+ * Returns:
+ *   - string  → rewritten search query
+ *   - null    → LLM explicitly said NO_SEARCH
+ *
+ * On ANY failure (network error, empty response, parse error) this function
+ * NEVER throws. It falls back to lastWordsFallback() so the search pipeline
+ * always gets a reasonable query.
  */
 export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<string | null> {
   const { apiUrl, model, messages, currentInput } = options;
 
-  // Build a compact history string from the last 3–4 turns (~6 messages)
-  const recentMessages = messages.slice(-6);
-  const historyText = recentMessages
+  // Build a compact history string from the last 3 turns (~6 messages)
+  const recentHistory = messages
+    .slice(-6)
     .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
     .join("\n");
 
-  const userPrompt = `CHAT HISTORY:
-${historyText || "(no previous messages)"}
+  // Single prompt string — no system/user separation that can confuse small models
+  const prompt = `You are a search query generator.
+Extract the core search keywords from the user's input.
+Output ONLY the keywords. Max 4 words. No quotes, no explanation.
 
-LATEST USER INPUT: ${currentInput}
+${recentHistory ? `Chat history:\n${recentHistory}\n` : ""}User input: "${currentInput}"
 
-SEARCH QUERY:`;
+Keywords:`;
 
+  // Use /api/generate (simpler than /api/chat) and force non-streaming
+  const url = apiUrl.replace("/api/chat", "/api/generate");
   const payload = {
     model,
-    messages: [
-      { role: "system", content: REWRITER_SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
+    prompt,
     stream: false,
     options: {
-      temperature: 0.1,   // very deterministic
-      num_predict: 40,    // very short output
+      temperature: 0.1,
+      num_predict: 20,
       top_p: 0.5,
+      stop: ["\n"], // stop at first newline to prevent extra junk
     },
   };
 
-  console.log("[Web Search] Rewriting query via Ollama...");
+  console.log("[Web Search] Rewriting query via Ollama /api/generate...");
   const start = performance.now();
 
-  const res = await fetch(apiUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  let raw = "";
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
-  if (!res.ok) {
-    throw new Error(`Ollama rewriter HTTP ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`Ollama rewriter HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    // /api/generate returns { response: "...", done: true, ... }
+    // Defensive: also check common alternative paths
+    raw = String(
+      data.response ??
+      data.message?.content ??
+      data.content ??
+      data.text ??
+      ""
+    ).trim();
+
+    const elapsed = Math.round(performance.now() - start);
+    console.log("[Web Search] Rewriter raw output (" + elapsed + "ms): '" + raw + "'");
+  } catch (err) {
+    const elapsed = Math.round(performance.now() - start);
+    console.error("[Web Search] Rewriter call failed after " + elapsed + "ms:", err);
+    return lastWordsFallback(currentInput);
   }
 
-  const data = await res.json();
-  const raw = (data.message?.content || data.response || "").trim();
-  const elapsed = Math.round(performance.now() - start);
-
-  console.log("[Web Search] Rewriter raw output (", elapsed, "ms):", raw);
-
-  // Handle NO_SEARCH
-  if (raw === "NO_SEARCH" || raw.toUpperCase() === "NO_SEARCH") {
+  // NO_SEARCH guard
+  if (!raw || raw.toUpperCase() === "NO_SEARCH") {
+    console.log("[Web Search] Rewriter returned NO_SEARCH");
     return null;
   }
 
   // Clean up: remove quotes, markdown, extra whitespace
   let cleaned = raw
-    .replace(/^["'`]+|["'`]+$/g, "") // surrounding quotes
-    .replace(/\*\*|__|`/g, "")       // markdown
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\*\*|__|`/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
+  // If still empty after cleanup, fallback to last words
   if (!cleaned || cleaned.length < 2) {
-    throw new Error("Rewriter returned empty string");
+    console.log("[Web Search] Rewriter returned empty after cleanup, using word fallback");
+    return lastWordsFallback(currentInput);
   }
 
   return cleaned;

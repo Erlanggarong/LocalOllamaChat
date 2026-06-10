@@ -520,23 +520,19 @@ export default function ChatPage() {
       let skipSearch = false;
 
       // Step 1: Rewrite conversational query into standalone search keywords
-      try {
-        const rewritten = await rewriteSearchQuery({
-          apiUrl,
-          model,
-          messages: messages.slice(-6),
-          currentInput: userContent,
-        });
-        if (rewritten === null) {
-          console.log("[Web Search] Rewriter says NO_SEARCH, skipping web search");
-          skipSearch = true;
-        } else {
-          searchQuery = rewritten;
-          console.log("[Web Search] Original:", userContent, "→ Rewritten:", searchQuery);
-        }
-      } catch (err) {
-        console.error("[Web Search] Query rewrite failed, using original:", err);
-        // fallback to original query
+      // This never throws — on failure it returns the last 3-4 words as a fallback.
+      const rewritten = await rewriteSearchQuery({
+        apiUrl,
+        model,
+        messages: messages.slice(-6),
+        currentInput: userContent,
+      });
+      if (rewritten === null) {
+        console.log("[Web Search] Rewriter says NO_SEARCH, skipping web search");
+        skipSearch = true;
+      } else {
+        searchQuery = rewritten;
+        console.log("[Web Search] Original:", userContent, "→ Rewritten:", searchQuery);
       }
 
       // Step 2: Execute search with (possibly rewritten) query
