@@ -133,8 +133,11 @@ export async function extractPageContent(
     const res = await fetch(url, {
       signal: controller.signal,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Accept: "text/html",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
       },
     });
     clearTimeout(timeout);
@@ -147,6 +150,9 @@ export async function extractPageContent(
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 
+    // Site-specific cleanup
+    const isWikipedia = url.includes("wikipedia.org") || url.includes("wikimedia.org");
+
     const removeSelectors = [
       "script", "style", "nav", "header", "footer", "aside",
       "[class*='ad']", "[class*='advertisement']",
@@ -154,20 +160,40 @@ export async function extractPageContent(
       "[class*='cookie']", "[class*='popup']",
       "[id*='ad']", "[id*='sidebar']", "[id*='cookie']",
       "iframe", "noscript", "svg", "canvas",
-    ];
+      // Wikipedia-specific elements to remove
+      isWikipedia ? ".infobox" : "",
+      isWikipedia ? ".toc" : "",
+      isWikipedia ? ".navbox" : "",
+      isWikipedia ? ".catlinks" : "",
+      isWikipedia ? ".mw-editsection" : "",
+      isWikipedia ? ".mw-jump-link" : "",
+      isWikipedia ? ".reflist" : "",
+      isWikipedia ? ".reference" : "",
+      isWikipedia ? ".thumbinner" : "",
+      isWikipedia ? ".image" : "",
+    ].filter(Boolean);
 
     removeSelectors.forEach((sel) => {
-      doc.querySelectorAll(sel).forEach((el) => el.remove());
+      if (sel) doc.querySelectorAll(sel).forEach((el) => el.remove());
     });
 
     let contentEl: Element | null =
+      // Wikipedia-specific
+      (isWikipedia ? doc.querySelector("#mw-content-text") : null) ||
+      (isWikipedia ? doc.querySelector(".mw-parser-output") : null) ||
+      // Generic semantic HTML
       doc.querySelector("article") ||
       doc.querySelector("main") ||
       doc.querySelector('[role="main"]') ||
+      // Common content containers
       doc.querySelector(".content") ||
       doc.querySelector("#content") ||
+      doc.querySelector("#main-content") ||
+      doc.querySelector(".main-content") ||
       doc.querySelector(".post") ||
       doc.querySelector(".entry") ||
+      doc.querySelector(".post-content") ||
+      doc.querySelector(".entry-content") ||
       doc.querySelector("[class*='article']") ||
       doc.querySelector("[class*='post-body']") ||
       doc.querySelector("body");
@@ -178,6 +204,11 @@ export async function extractPageContent(
 
     let text = contentEl.textContent || "";
     text = cleanExtractedText(text);
+
+    // Remove Wikipedia category links at the bottom
+    if (isWikipedia) {
+      text = text.replace(/Categories?:\s*.*/gi, "").trim();
+    }
 
     if (maxLength > 0 && text.length > maxLength) {
       text = text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`;
