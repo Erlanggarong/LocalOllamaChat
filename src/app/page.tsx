@@ -517,8 +517,9 @@ export default function ChatPage() {
     if (webSearchEnabled) {
       setIsSearchingWeb(true);
       try {
-        const searchResponse = await searchWithContent(userContent, 5, true);
+        const searchResponse = await searchWithContent(userContent, 3, true);
         setIsSearchingWeb(false);
+        console.log("[Web Search]", searchResponse.status);
         if (searchResponse.results.length > 0) {
           const formattedResults = searchResponse.results.map((r, idx) => {
             let text = (idx + 1) + ". " + r.title + "\n" + "URL: " + r.url + "\n" + "Description: " + r.description;
@@ -527,9 +528,15 @@ export default function ChatPage() {
             }
             return text;
           });
-          webSearchContext = "Use the following web search results to help answer the query. Cite sources when appropriate.\n\n" +
+          let context = "Use the following web search results to help answer the user's query. Cite sources when appropriate. Focus on answering the user's specific question.\n\n" +
             "Status: " + searchResponse.status + "\n\n" +
             formattedResults.join("\n\n---\n\n") + "\n\n";
+          // Limit total web search context to avoid overflowing the model's context window
+          const MAX_WEB_CONTEXT = 12000;
+          if (context.length > MAX_WEB_CONTEXT) {
+            context = context.substring(0, MAX_WEB_CONTEXT) + "\n\n[Web search context truncated to avoid exceeding context window]\n\n";
+          }
+          webSearchContext = context;
         }
       } catch (err) {
         setIsSearchingWeb(false);

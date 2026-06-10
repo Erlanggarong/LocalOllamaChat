@@ -120,7 +120,7 @@ function cleanExtractedText(text: string): string {
 
 export async function extractPageContent(
   url: string,
-  maxLength: number = 8000
+  maxLength: number = 3000
 ): Promise<{ content: string; status: "success" | "error"; error?: string }> {
   if (isPdfUrl(url)) {
     return { content: "", status: "error", error: "PDF files not supported" };
@@ -202,7 +202,34 @@ export async function extractPageContent(
       return { content: "", status: "error", error: "No content found" };
     }
 
-    let text = contentEl.textContent || "";
+    // For Wikipedia, extract only the lead section (before first h2 heading)
+    // This gives the most relevant summary and avoids huge tables/lists
+    let text = "";
+    if (isWikipedia) {
+      const children = Array.from(contentEl.children);
+      const leadParts: string[] = [];
+      for (const child of children) {
+        const tag = child.tagName.toLowerCase();
+        // Stop at first section heading
+        if (tag === "h2" || tag === "h3" || tag === "section") break;
+        // Skip non-content elements
+        if (["div", "table", "ul", "ol"].includes(tag)) {
+          // Only include if it looks like a paragraph container
+          if (child.querySelector("p")) {
+            leadParts.push(child.textContent || "");
+          }
+          continue;
+        }
+        leadParts.push(child.textContent || "");
+      }
+      text = leadParts.join("\n\n");
+    }
+
+    // Fallback to full content if lead section is empty
+    if (!text.trim()) {
+      text = contentEl.textContent || "";
+    }
+
     text = cleanExtractedText(text);
 
     // Remove Wikipedia category links at the bottom
