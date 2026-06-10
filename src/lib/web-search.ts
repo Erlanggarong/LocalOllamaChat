@@ -446,55 +446,45 @@ function lastWordsFallback(input: string): string {
 }
 
 /**
- * Calls local Ollama (/api/generate, stream: false) to rewrite a conversational
+ * Calls local Ollama (/api/chat, stream: false) to rewrite a conversational
  * query into concise search keywords.
  *
  * Returns:
  *   - string  → rewritten search query
  *   - null    → LLM explicitly said NO_SEARCH
  *
- * On ANY failure (network error, empty response, parse error) this function
- * NEVER throws. It falls back to lastWordsFallback() so the search pipeline
- * always gets a reasonable query.
+ * On ANY failure this NEVER throws. It falls back to lastWordsFallback().
  */
 export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<string | null> {
   const { apiUrl, model, messages, currentInput } = options;
 
-  // Build a compact history string from the last 3 turns (~6 messages)
-  const recentHistory = messages
-    .slice(-6)
-    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
-    .join("\n");
+  // Inject recent chat history as message pairs so the model can resolve
+  // anaphoric references ("explain that", "the second point", etc.)
+  const historyMessages = messages.slice(-4).map((m) => ({
+    role: m.role as "user" | "assistant" | "system",
+    content: m.content,
+  }));
 
-  // Single prompt string — no system/user separation that can confuse small models
-  const prompt = `You are a search query generator.
-Extract the core search keywords from the user's input.
-Output ONLY the keywords. Max 4 words. No quotes, no explanation.
-
-${recentHistory ? `Chat history:\n${recentHistory}\n` : ""}User input: "${currentInput}"
-
-Keywords:`;
-
-  // Use /api/generate (simpler than /api/chat) and force non-streaming
-  const url = apiUrl.replace("/api/chat", "/api/generate");
   const payload = {
     model,
-    prompt,
+    messages: [
+      {
+        role: "system" as const,
+        content:
+          "You are a search query generator. Output ONLY the search keywords based on the user prompt. Max 4 words. No quotes, no explanation. If it is a greeting or does not need a search, output exactly: NO_SEARCH",
+      },
+      ...historyMessages,
+      { role: "user" as const, content: currentInput },
+    ],
     stream: false,
-    options: {
-      temperature: 0.1,
-      num_predict: 20,
-      top_p: 0.5,
-      stop: ["\n"], // stop at first newline to prevent extra junk
-    },
   };
 
-  console.log("[Web Search] Rewriting query via Ollama /api/generate...");
+  console.log("[Web Search] Rewriting query via Ollama /api/chat...");
   const start = performance.now();
 
   let raw = "";
   try {
-    const res = await fetch(url, {
+    const res = await fetch(apiUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -506,15 +496,8 @@ Keywords:`;
 
     const data = await res.json();
 
-    // /api/generate returns { response: "...", done: true, ... }
-    // Defensive: also check common alternative paths
-    raw = String(
-      data.response ??
-      data.message?.content ??
-      data.content ??
-      data.text ??
-      ""
-    ).trim();
+    // /api/chat with stream:false returns { message: { role:"assistant", content:"..." }, done: true }
+    raw = String(data.message?.content ?? "").trim();
 
     const elapsed = Math.round(performance.now() - start);
     console.log("[Web Search] Rewriter raw output (" + elapsed + "ms): '" + raw + "'");
