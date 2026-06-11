@@ -10,7 +10,8 @@ Named **My-Kizo** — your personal AI companion that runs entirely locally.
 - **Multi-session chat history** — persisted to `localStorage`, survives app restarts
 - **Image support** — upload, drag & drop, paste from clipboard (`Ctrl+V`), click-to-zoom
 - **Auto image compression** — resizes large images via canvas before sending (max 1024×1024, JPEG 0.85)
-- **Web Search / RAG** — DuckDuckGo + Bing multi-engine search with **full page content extraction** (toggleable)
+- **Web Search / RAG** — DuckDuckGo + Bing + Wikipedia multi-engine search with **full page content extraction** (toggleable)
+- **MCP (Model Context Protocol) Support** — Expand capabilities with external tools and servers via `public/mcp-config.json`
 - **Voice input** — Web Speech API with Indonesian (`id-ID`) support
 - **Model switcher** — auto-detects available Ollama models, quick-switch dropdown
 - **7 animated themes** — Pixel Anime, Cyberpunk, Minimal, Ocean, Sunset, Forest, Midnight
@@ -175,7 +176,8 @@ The installer will be in `src-tauri/target/release/bundle/`.
 ```
 .
 ├── public/
-│   └── app-config.json           # External defaults (model, theme, params, etc.)
+│   ├── app-config.json           # External defaults (model, theme, params, etc.)
+│   └── mcp-config.json           # MCP Servers configuration
 ├── src/                          # Next.js frontend
 │   ├── app/
 │   │   ├── page.tsx              # Main chat UI component
@@ -184,8 +186,9 @@ The installer will be in `src-tauri/target/release/bundle/`.
 │   ├── components/
 │   │   ├── DynamicBackground.tsx # Animated canvas themes
 │   │   └── MarkdownRenderer.tsx  # Markdown + syntax highlighting
-│   └── lib/
-│       └── web-search.ts         # Multi-engine web search + content extraction
+│   ├── lib/
+│   │   ├── web-search.ts         # Multi-engine web search + content extraction
+│   │   └── mcp.ts                # Model Context Protocol client logic
 ├── src-tauri/                    # Tauri (Rust) backend
 │   ├── src/
 │   │   └── main.rs               # Tray, window position, global hotkey, Ollama spawn
@@ -230,11 +233,15 @@ Any changes you make in the Settings panel (model, temperature, theme, etc.) are
 
 When enabled via the globe icon 🌐 in the input area, the app performs:
 
-1. **Search**: Tries DuckDuckGo HTML first, falls back to Bing if blocked
+1. **Search**: Tries DuckDuckGo HTML first, falls back to Bing or Wikipedia if blocked
 2. **Content Extraction**: Fetches each result URL, parses DOM, strips ads/nav/sidebars, extracts main content
 3. **Context Injection**: Formats results with title, URL, description, and full page content into a system message sent to Ollama
 
-The extraction uses browser-native `fetch()` + `DOMParser`, targeting semantic HTML elements (`<article>`, `<main>`, `<body>`) with aggressive cleanup of non-content elements.
+The extraction uses a custom `rustFetch` command via the Tauri backend to bypass WebView CORS and network blocks, combined with `DOMParser`, targeting semantic HTML elements (`<article>`, `<main>`, `<body>`) with aggressive cleanup of non-content elements.
+
+### MCP (Model Context Protocol)
+
+My-Kizo supports the Model Context Protocol, allowing local LLMs to seamlessly interact with external tools and data sources. Server connections (like `@modelcontextprotocol/server-everything`) are defined in `public/mcp-config.json`. The Tauri backend spawns and manages these server processes, passing JSON-RPC messages between the Next.js frontend and the MCP servers via standard input/output.
 
 ### Auto-Start Ollama
 

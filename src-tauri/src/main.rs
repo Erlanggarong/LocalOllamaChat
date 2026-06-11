@@ -4,9 +4,17 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use tauri::{AppHandle, GlobalWindowEvent, Manager, SystemTray, SystemTrayEvent, WindowEvent, LogicalPosition, GlobalShortcutManager};
 
 struct OllamaProcess(Mutex<Option<Child>>);
+
+struct McpServer {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+}
+struct McpState(Mutex<HashMap<String, McpServer>>);
 
 #[derive(serde::Serialize)]
 struct FetchResponse {
@@ -37,6 +45,111 @@ async fn fetch_url(url: String) -> Result<FetchResponse, String> {
     Ok(FetchResponse { status, body })
 }
 
+#[tauri::command]
+fn spawn_mcp_server(
+    window: tauri::Window,
+    state: tauri::State<'_, McpState>,
+    id: String,
+    command_name: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    session_id: String,
+) -> Result<(), String> {
+    let mut map = state.0.lock().unwrap();
+    if let Some(mut existing) = map.remove(&id) {
+        let _ = existing.child.kill();
+    }
+
+    let mut command = if cfg!(target_os = "windows") && (command_name == "npm" || command_name == "npx" || command_name == "uvx" || command_name == "uv" || command_name == "npx.cmd") {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/c").arg(&command_name);
+        c
+    } else {
+        std::process::Command::new(&command_name)
+    };
+
+    command.args(args);
+    command.envs(env);
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let mut child = command.spawn().map_err(|e| format!("Failed to spawn {}: {}", command_name, e))?;
+
+    let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
+    let stdin = child.stdin.take();
+
+    let id_clone = id.clone();
+    let session_id_clone = session_id.clone();
+    let window_clone = window.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let _ = window_clone.emit(&format!("mcp_stdout_{}_{}", id_clone, session_id_clone), l);
+            } else if let Err(_) = line {
+            }
+        }
+        let _ = window_clone.emit(&format!("mcp_exit_{}_{}", id_clone, session_id_clone), "stdout closed");
+    });
+
+    let id_clone2 = id.clone();
+    let session_id_clone2 = session_id.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let _ = window.emit(&format!("mcp_stderr_{}_{}", id_clone2, session_id_clone2), l);
+            }
+        }
+    });
+
+    map.insert(id, McpServer { child, stdin });
+    Ok(())
+}
+
+#[tauri::command]
+fn write_mcp_stdin(
+    state: tauri::State<'_, McpState>,
+    id: String,
+    message: String,
+) -> Result<(), String> {
+    let mut map = state.0.lock().unwrap();
+    if let Some(server) = map.get_mut(&id) {
+        if let Some(stdin) = &mut server.stdin {
+            let msg = format!("{}\n", message);
+            stdin.write_all(msg.as_bytes()).map_err(|e| e.to_string())?;
+            stdin.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        } else {
+            Err("Stdin not available".into())
+        }
+    } else {
+        Err(format!("Server {} not running", id))
+    }
+}
+
+#[tauri::command]
+fn kill_mcp_server(
+    state: tauri::State<'_, McpState>,
+    id: String,
+) -> Result<(), String> {
+    let mut map = state.0.lock().unwrap();
+    if let Some(mut server) = map.remove(&id) {
+        let _ = server.child.kill();
+        Ok(())
+    } else {
+        Err(format!("Server {} not running", id))
+    }
+}
+
 fn main() {
     let tray_menu = tauri::SystemTrayMenu::new()
         .add_item(tauri::CustomMenuItem::new("show", "Show"))
@@ -51,6 +164,7 @@ fn main() {
             // Spawn Ollama in the background (if not already running)
             let ollama_child = spawn_ollama();
             app.manage(OllamaProcess(Mutex::new(ollama_child)));
+            app.manage(McpState(Mutex::new(HashMap::new())));
 
             // Position window at top-right of screen (0px from top)
             if let Some(window) = app.get_window("main") {
@@ -79,7 +193,12 @@ fn main() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![fetch_url])
+        .invoke_handler(tauri::generate_handler![
+            fetch_url,
+            spawn_mcp_server,
+            write_mcp_stdin,
+            kill_mcp_server
+        ])
         .system_tray(tray)
         .on_system_tray_event(on_tray_event)
         .on_window_event(on_window_event)
@@ -165,6 +284,13 @@ fn on_tray_event(app: &AppHandle, event: SystemTrayEvent) {
                 if let Some(state) = app.try_state::<OllamaProcess>() {
                     if let Ok(mut child) = state.0.lock() {
                         if let Some(ref mut c) = *child { let _ = c.kill(); }
+                    }
+                }
+                if let Some(mcp_state) = app.try_state::<McpState>() {
+                    if let Ok(mut map) = mcp_state.0.lock() {
+                        for (_, server) in map.iter_mut() {
+                            let _ = server.child.kill();
+                        }
                     }
                 }
                 app.exit(0);

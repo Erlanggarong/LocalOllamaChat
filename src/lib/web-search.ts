@@ -43,7 +43,6 @@ async function rustFetch(url: string): Promise<{ status: number; body: string }>
 
 function logRaw(label: string, body: string, maxLen = 2000) {
   const preview = body.substring(0, maxLen).replace(/\s+/g, " ").trim();
-  console.log(`[Web Search] Raw ${label} (${body.length} chars):`, preview);
 }
 
 // ========== URL DETECTION ==========
@@ -176,11 +175,9 @@ function extractStructuredText(root: Element): string {
 // ========== API-BASED SEARCH ENGINES ==========
 
 async function searchDuckDuckGoAPI(query: string, limit: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying DuckDuckGo Instant Answer API...");
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=mykizo`;
 
   const { status, body } = await rustFetch(url);
-  console.log("[Web Search] DDG API status:", status);
 
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!body || body.length < 50) throw new Error("Empty response");
@@ -236,16 +233,13 @@ async function searchDuckDuckGoAPI(query: string, limit: number): Promise<Search
     }
   }
 
-  console.log("[Web Search] DDG API parsed:", results.length);
   return results;
 }
 
 async function searchWikipedia(query: string, limit: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying Wikipedia API...");
   const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${limit}&format=json&utf8=1&redirects=1`;
 
   const { status, body } = await rustFetch(searchUrl);
-  console.log("[Web Search] Wikipedia search status:", status);
 
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!body) throw new Error("Empty response");
@@ -263,11 +257,9 @@ async function searchWikipedia(query: string, limit: number): Promise<SearchResu
 
   const searchResults = data?.query?.search;
   if (!Array.isArray(searchResults)) {
-    console.log("[Web Search] Wikipedia unexpected keys:", Object.keys(data));
     throw new Error("Unexpected JSON structure");
   }
 
-  console.log("[Web Search] Wikipedia raw results:", searchResults.length);
 
   const results: SearchResult[] = [];
   for (const item of searchResults.slice(0, limit)) {
@@ -282,11 +274,9 @@ async function searchWikipedia(query: string, limit: number): Promise<SearchResu
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">");
 
-    console.log("[Web Search] Wikipedia candidate:", title, "|", snippet.substring(0, 80));
     results.push({ title, url, description: snippet });
   }
 
-  console.log("[Web Search] Wikipedia parsed:", results.length);
   return results;
 }
 
@@ -300,7 +290,6 @@ function extractResultsFromHtml(html: string, numResults: number, engineName: st
   const seenUrls = new Set<string>();
 
   const containers = doc.querySelectorAll("li, div, article");
-  console.log(`[Web Search] ${engineName} scanning ${containers.length} containers...`);
 
   for (const container of Array.from(containers)) {
     if (results.length >= numResults) break;
@@ -348,14 +337,12 @@ function extractResultsFromHtml(html: string, numResults: number, engineName: st
     }
 
     if (description) {
-      console.log(`[Web Search] ${engineName} candidate: "${title.substring(0, 60)}..." | desc:${description.substring(0, 80)}...`);
       seenUrls.add(url);
       results.push({ title, url, description: description.substring(0, 500) });
     }
   }
 
   if (results.length === 0) {
-    console.log(`[Web Search] ${engineName} fallback: scanning all <a> tags...`);
     const allLinks = doc.querySelectorAll("a[href^='http']");
     for (const link of Array.from(allLinks)) {
       if (results.length >= numResults) break;
@@ -379,16 +366,13 @@ function extractResultsFromHtml(html: string, numResults: number, engineName: st
     }
   }
 
-  console.log(`[Web Search] ${engineName} total extracted:`, results.length);
   return results;
 }
 
 async function searchBing(query: string, numResults: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying Bing (generic parser)...");
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${numResults}&setmkt=en-US&setlang=en`;
 
   const { status, body: html } = await rustFetch(url);
-  console.log("[Web Search] Bing status:", status, "length:", html?.length || 0);
 
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!html || html.length < 200) throw new Error("Empty/blocked response");
@@ -398,11 +382,9 @@ async function searchBing(query: string, numResults: number): Promise<SearchResu
 }
 
 async function searchDuckDuckGoLite(query: string, numResults: number): Promise<SearchResult[]> {
-  console.log("[Web Search] Trying DuckDuckGo Lite (generic parser)...");
   const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}&kl=us-en`;
 
   const { status, body: html } = await rustFetch(url);
-  console.log("[Web Search] DDG Lite status:", status, "length:", html?.length || 0);
 
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
   if (!html || html.length < 200) throw new Error("Empty/blocked response");
@@ -426,9 +408,7 @@ export async function extractPageContent(
   }
 
   try {
-    console.log("[Web Search] Fetching content:", url);
     const { status, body: html } = await rustFetch(url);
-    console.log("[Web Search] Content status:", status, "length:", html?.length || 0);
 
     if (status < 200 || status >= 300) {
       return { content: "", status: "error", error: `HTTP ${status}` };
@@ -481,11 +461,9 @@ export async function extractPageContent(
       return { content: text.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`, status: "success" };
     }
 
-    console.log("[Web Search] Extracted:", text.length, "chars from", url);
     return { content: text, status: "success" };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    console.error("[Web Search] Content extraction failed:", url, message);
     return { content: "", status: "error", error: message };
   }
 }
@@ -527,7 +505,6 @@ export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<
     stream: false,
   };
 
-  console.log("[Web Search] Rewriting query via Ollama /api/chat...");
   const start = performance.now();
 
   let raw = "";
@@ -546,15 +523,12 @@ export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<
     raw = String(data.message?.content ?? "").trim();
 
     const elapsed = Math.round(performance.now() - start);
-    console.log("[Web Search] Rewriter raw output (" + elapsed + "ms): '" + raw + "'");
   } catch (err) {
     const elapsed = Math.round(performance.now() - start);
-    console.error("[Web Search] Rewriter call failed after " + elapsed + "ms:", err);
     return lastWordsFallback(currentInput);
   }
 
   if (!raw || raw.toUpperCase() === "NO_SEARCH") {
-    console.log("[Web Search] Rewriter returned NO_SEARCH");
     return null;
   }
 
@@ -565,7 +539,6 @@ export async function rewriteSearchQuery(options: RewriteQueryOptions): Promise<
     .trim();
 
   if (!cleaned || cleaned.length < 2) {
-    console.log("[Web Search] Rewriter returned empty after cleanup, using word fallback");
     return lastWordsFallback(currentInput);
   }
 
@@ -581,14 +554,12 @@ export async function searchWithContent(
   rewriterOptions?: RewriteQueryOptions
 ): Promise<SearchResponse> {
   const startTime = Date.now();
-  console.log("[Web Search] ========== Starting search for:", query);
 
   // ------------------------------------------------------------------
   // 1. URL BYPASS: if the query contains a direct URL, fetch it directly
   // ------------------------------------------------------------------
   const directUrl = extractUrlFromQuery(query);
   if (directUrl) {
-    console.log("[Web Search] Direct URL detected:", directUrl);
     const extracted = await extractPageContent(directUrl, 12000);
 
     return {
@@ -615,7 +586,6 @@ export async function searchWithContent(
   if (rewriterOptions) {
     const rewritten = await rewriteSearchQuery(rewriterOptions);
     if (rewritten === null) {
-      console.log("[Web Search] Rewriter says NO_SEARCH, skipping web search");
       return {
         results: [],
         totalResults: 0,
@@ -624,7 +594,6 @@ export async function searchWithContent(
       };
     }
     searchQuery = rewritten;
-    console.log("[Web Search] Original:", query, "→ Rewritten:", searchQuery);
   }
 
   // ------------------------------------------------------------------
@@ -646,20 +615,16 @@ export async function searchWithContent(
       results = await eng.fn();
       if (results.length > 0) {
         engine = eng.name;
-        console.log("[Web Search] Success with", eng.name, "-", results.length, "results");
         break;
       }
-      console.log("[Web Search]", eng.name, "returned 0 results, trying next...");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "failed";
-      console.error("[Web Search]", eng.name, "failed:", msg);
       errors.push(`${eng.name}: ${msg}`);
     }
   }
 
   if (results.length === 0) {
     const status = `All search engines failed: ${errors.join("; ")}`;
-    console.error("[Web Search]", status);
     return {
       results: [],
       totalResults: 0,
@@ -704,7 +669,6 @@ export async function searchWithContent(
   }
   status += `; ${searchTime}ms`;
 
-  console.log("[Web Search] Final:", status);
 
   return {
     results: finalResults,

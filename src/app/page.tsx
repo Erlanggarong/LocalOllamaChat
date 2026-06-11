@@ -3,6 +3,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import MarkdownRenderer from "@/components/MarkdownRenderer";
 import DynamicBackground from "@/components/DynamicBackground";
+import { z } from "zod";
 import { searchWithContent } from "@/lib/web-search";
 
 interface MessageMetrics {
@@ -12,10 +13,11 @@ interface MessageMetrics {
 }
 
 interface Message {
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "tool";
   content: string;
   images?: string[];
   metrics?: MessageMetrics;
+  tool_calls?: any[];
 }
 
 interface ChatSession {
@@ -115,7 +117,6 @@ async function fetchModels(apiUrl: string): Promise<string[]> {
     }
     return [];
   } catch (err) {
-    console.error("Fetch models error:", err);
     return [];
   }
 }
@@ -149,6 +150,21 @@ export default function ChatPage() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [zoomImage, setZoomImage] = useState<string | null>(null);
   const [showTokenMetrics, setShowTokenMetrics] = useState(true);
+
+  // MCP State
+  const [mcpClients, setMcpClients] = useState<Record<string, any>>({});
+  const [mcpTools, setMcpTools] = useState<any[]>([]);
+  const [mcpConfigText, setMcpConfigText] = useState("");
+  const [mcpEnabled, setMcpEnabled] = useState(false);
+
+  const hasMcpConfigured = useMemo(() => {
+    try {
+      const parsed = JSON.parse(mcpConfigText);
+      return parsed.mcpServers && Object.keys(parsed.mcpServers).length > 0;
+    } catch {
+      return false;
+    }
+  }, [mcpConfigText]);
 
   // Web Search state
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
@@ -193,12 +209,49 @@ export default function ChatPage() {
         if (typeof (merged as any).showTokenMetrics === "boolean") {
           setShowTokenMetrics((merged as any).showTokenMetrics);
         }
+        if (typeof (merged as any).mcpEnabled === "boolean") {
+          setMcpEnabled((merged as any).mcpEnabled);
+        }
+        if (typeof (merged as any).webSearchEnabled === "boolean") {
+          setWebSearchEnabled((merged as any).webSearchEnabled);
+        }
         setConfigLoaded(true);
       })
       .catch((err) => {
-        console.error("Failed to load app-config.json:", err);
         setConfigLoaded(true);
       });
+
+    const savedMcpConfig = localStorage.getItem("mykizo-mcp-config");
+    if (savedMcpConfig) {
+      setMcpConfigText(savedMcpConfig);
+    } else {
+      fetch("/mcp-config.json").then(r => r.text()).then(t => setMcpConfigText(t)).catch(() => {});
+    }
+
+    import("../lib/mcp").then(({ initializeMcpClients }) => {
+      initializeMcpClients().then(async (clients) => {
+        setMcpClients(clients);
+        const tools: any[] = [];
+        for (const [id, client] of Object.entries(clients)) {
+          try {
+            // Bypass strict zod validation on MCP SDK since some external servers return invalid schemas
+            const res = await (client as any).request({ method: "tools/list" }, z.any());
+            for (const t of res.tools) {
+              tools.push({
+                type: "function",
+                function: {
+                  name: `${id}__${t.name}`,
+                  description: t.description,
+                  parameters: t.inputSchema
+                }
+              });
+            }
+          } catch (err) {
+          }
+        }
+        setMcpTools(tools);
+      });
+    });
   }, []);
 
   // Fetch available models from Ollama
@@ -258,7 +311,7 @@ export default function ChatPage() {
   // Save preset config to localStorage
   useEffect(() => {
     if (!configLoaded) return;
-    const preset: Partial<AppConfig> & { showTokenMetrics?: boolean } = {
+    const preset: Partial<AppConfig> & { showTokenMetrics?: boolean; mcpEnabled?: boolean; webSearchEnabled?: boolean } = {
       model,
       botName,
       systemPrompt,
@@ -269,9 +322,11 @@ export default function ChatPage() {
       apiUrl,
       theme,
       showTokenMetrics,
+      mcpEnabled,
+      webSearchEnabled,
     };
     localStorage.setItem(STORAGE_CONFIG_KEY, JSON.stringify(preset));
-  }, [configLoaded, model, botName, systemPrompt, temperature, topP, numCtx, numPredict, apiUrl, theme, showTokenMetrics]);
+  }, [configLoaded, model, botName, systemPrompt, temperature, topP, numCtx, numPredict, apiUrl, theme, showTokenMetrics, mcpEnabled, webSearchEnabled]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId);
   const messages = activeSession?.messages || [];
@@ -425,7 +480,6 @@ export default function ChatPage() {
         try {
           return await compressImage(file, 1024, 1024, 0.85);
         } catch (err) {
-          console.error("Image compression failed:", err);
           // Fallback: read raw file
           return new Promise<string>((resolve) => {
             const reader = new FileReader();
@@ -525,10 +579,8 @@ export default function ChatPage() {
           currentInput: userContent,
         });
         setIsSearchingWeb(false);
-        console.log("[Web Search]", searchResponse.status);
 
         if (searchResponse.status === "NO_SEARCH") {
-          console.log("[Web Search] Skipped — rewriter determined no search needed");
         } else if (searchResponse.results.length > 0) {
           const formattedResults = searchResponse.results.map((r, idx) => {
             let text = (idx + 1) + ". " + r.title + "\n" + "URL: " + r.url + "\n" + "Description: " + r.description;
@@ -549,7 +601,6 @@ export default function ChatPage() {
         }
       } catch (err) {
         setIsSearchingWeb(false);
-        console.error("Web search error:", err);
       }
     }
 
@@ -588,7 +639,7 @@ export default function ChatPage() {
       systemMessages.push({ role: "system", content: webSearchContext });
     }
 
-    const payload = {
+    const initialPayload: any = {
       model,
       messages: [
         ...systemMessages,
@@ -598,6 +649,7 @@ export default function ChatPage() {
             role: m.role,
             content: m.content,
             ...(m.images ? { images: m.images } : {}),
+            ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
           })),
         {
           role: userMessage.role,
@@ -613,108 +665,178 @@ export default function ChatPage() {
         num_predict: numPredict,
       },
     };
-
-    abortRef.current = new AbortController();
-
-    let res: Response | null = null;
-    let lastErr: Error | null = null;
-
-    // Retry connection up to 3 times (gives Ollama time to start)
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        res = await fetch(apiUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-          signal: abortRef.current.signal,
-        });
-        if (res.ok) break;
-      } catch (err) {
-        lastErr = err as Error;
-        if ((err as Error).name === "AbortError") break;
-        if (attempt < 2) await new Promise((r) => setTimeout(r, 1500));
-      }
+    if (mcpEnabled && mcpTools.length > 0) {
+      initialPayload.tools = mcpTools;
     }
 
-    try {
-      if (!res || !res.ok) throw lastErr || new Error("No response");
-      if (!res.body) throw new Error("No response body");
+    abortRef.current = new AbortController();
+    let currentPayload = initialPayload;
+    let continueChat = true;
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let done = false;
-      let assistantContent = "";
+    while (continueChat) {
+      continueChat = false;
+      let res: Response | null = null;
+      let lastErr: Error | null = null;
 
-      while (!done) {
-        const { value, done: readerDone } = await reader.read();
-        done = readerDone;
-        if (value) {
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split("\n").filter((line) => line.trim());
-          for (const line of lines) {
-            try {
-              const parsed = JSON.parse(line);
-              if (parsed.message?.content) {
-                assistantContent += parsed.message.content;
-                setSessions((prev) =>
-                  prev.map((s) => {
-                    if (s.id !== activeSessionId) return s;
-                    const updatedMessages = [...s.messages];
-                    updatedMessages[updatedMessages.length - 1] = {
-                      ...updatedMessages[updatedMessages.length - 1],
-                      content: assistantContent,
-                    };
-                    return { ...s, messages: updatedMessages };
-                  })
-                );
-              }
-              if (parsed.done) {
-                done = true;
-                // Capture token metrics from Ollama's final chunk
-                if (parsed.eval_count && parsed.eval_duration) {
-                  const tps = parsed.eval_count / (parsed.eval_duration / 1e9);
+      // Retry connection up to 3 times
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          res = await fetch(apiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(currentPayload),
+            signal: abortRef.current?.signal,
+          });
+          if (res.ok) break;
+        } catch (err) {
+          lastErr = err as Error;
+          if ((err as Error).name === "AbortError") break;
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+
+      try {
+        if (!res || !res.ok) throw lastErr || new Error("No response");
+        if (!res.body) throw new Error("No response body");
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let done = false;
+        let assistantContent = "";
+        let toolCalls: any[] = [];
+
+        while (!done) {
+          const { value, done: readerDone } = await reader.read();
+          done = readerDone;
+          if (value) {
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split("\n").filter((line) => line.trim());
+            for (const line of lines) {
+              try {
+                const parsed = JSON.parse(line);
+                if (parsed.message?.content) {
+                  assistantContent += parsed.message.content;
                   setSessions((prev) =>
                     prev.map((s) => {
                       if (s.id !== activeSessionId) return s;
                       const updatedMessages = [...s.messages];
                       updatedMessages[updatedMessages.length - 1] = {
                         ...updatedMessages[updatedMessages.length - 1],
-                        metrics: {
-                          evalCount: parsed.eval_count,
-                          evalDuration: parsed.eval_duration,
-                          tps: Math.round(tps * 10) / 10,
-                        },
+                        content: assistantContent,
                       };
                       return { ...s, messages: updatedMessages };
                     })
                   );
                 }
+                
+                if (parsed.message?.tool_calls) {
+                  toolCalls = parsed.message.tool_calls;
+                }
+
+                if (parsed.done) {
+                  done = true;
+                  
+                  if (toolCalls.length > 0) {
+                    // Execute tools
+                    const newToolResults: Message[] = [];
+                    for (const tc of toolCalls) {
+                      const [serverId, toolName] = tc.function.name.split("__");
+                      const client = mcpClients[serverId];
+                      if (client) {
+                        try {
+                          const result = await client.callTool({ name: toolName, arguments: tc.function.arguments });
+                          // Pass the entire result object directly to future-proof against any unexpected or new data formats.
+                          newToolResults.push({
+                            role: "tool",
+                            content: JSON.stringify(result),
+                          });
+                        } catch (e) {
+                          newToolResults.push({
+                            role: "tool",
+                            content: JSON.stringify({ error: String(e) }),
+                          });
+                        }
+                      }
+                    }
+
+                    if (newToolResults.length > 0) {
+                      // Add tool calls and results to payload for next turn
+                      currentPayload.messages.push({
+                        role: "assistant",
+                        content: assistantContent,
+                        tool_calls: toolCalls,
+                      });
+                      currentPayload.messages.push(...newToolResults.map((m) => ({
+                        role: m.role,
+                        content: m.content
+                      })));
+                      
+                      // Update UI state
+                      setSessions((prev) =>
+                        prev.map((s) => {
+                          if (s.id !== activeSessionId) return s;
+                          const updatedMessages = [...s.messages];
+                          updatedMessages[updatedMessages.length - 1] = {
+                            ...updatedMessages[updatedMessages.length - 1],
+                            content: assistantContent,
+                            tool_calls: toolCalls,
+                          };
+                          updatedMessages.push(...newToolResults);
+                          updatedMessages.push({ role: "assistant", content: "" });
+                          return { ...s, messages: updatedMessages };
+                        })
+                      );
+                      
+                      continueChat = true;
+                    }
+                  } else {
+                    // Capture token metrics from Ollama's final chunk
+                    if (parsed.eval_count && parsed.eval_duration) {
+                      const tps = parsed.eval_count / (parsed.eval_duration / 1e9);
+                      setSessions((prev) =>
+                        prev.map((s) => {
+                          if (s.id !== activeSessionId) return s;
+                          const updatedMessages = [...s.messages];
+                          updatedMessages[updatedMessages.length - 1] = {
+                            ...updatedMessages[updatedMessages.length - 1],
+                            metrics: {
+                              evalCount: parsed.eval_count,
+                              evalDuration: parsed.eval_duration,
+                              tps: Math.round(tps * 10) / 10,
+                            },
+                          };
+                          return { ...s, messages: updatedMessages };
+                        })
+                      );
+                    }
+                  }
+                }
+              } catch {
+                // ignore malformed JSON lines
               }
-            } catch {
-              // ignore malformed JSON lines
             }
           }
         }
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          setSessions((prev) =>
+            prev.map((s) => {
+              if (s.id !== activeSessionId) return s;
+              const updatedMessages = [...s.messages];
+              updatedMessages[updatedMessages.length - 1] = {
+                role: "assistant",
+                content: `Error: Failed to connect to Ollama at ${apiUrl}. Make sure Ollama is running.`,
+              };
+              return { ...s, messages: updatedMessages };
+            })
+          );
+        }
       }
-    } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        setSessions((prev) =>
-          prev.map((s) => {
-            if (s.id !== activeSessionId) return s;
-            const updatedMessages = [...s.messages];
-            updatedMessages[updatedMessages.length - 1] = {
-              role: "assistant",
-              content: `Error: Failed to connect to Ollama at ${apiUrl}. Make sure Ollama is running.`,
-            };
-            return { ...s, messages: updatedMessages };
-          })
-        );
-      }
-    } finally {
-      setIsLoading(false);
-      setIsSearchingWeb(false);
-      abortRef.current = null;
-    }
+    } // end while
+
+    setIsLoading(false);
+    setIsSearchingWeb(false);
+    abortRef.current = null;
   };
 
   const handleStop = () => {
@@ -818,6 +940,7 @@ export default function ChatPage() {
     <div
       ref={dropZoneRef}
       className="relative flex h-screen text-slate-200 antialiased overflow-hidden"
+      onDragEnter={handleDragOver}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -1243,13 +1366,45 @@ export default function ChatPage() {
                 <p className="text-[9px] text-slate-600 mt-1 leading-tight">Maximum tokens the model can generate in a single response.</p>
               </div>
             </div>
+            <div className="pt-2 border-t border-white/[0.06]">
+              <label className="block text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1.5">MCP Configuration (JSON)</label>
+              <textarea
+                value={mcpConfigText}
+                onChange={(e) => setMcpConfigText(e.target.value)}
+                className="w-full h-32 px-3 py-2 text-xs bg-black/40 border border-white/[0.06] rounded-md focus:outline-none focus:border-blue-500/50 text-slate-300 font-mono resize-y"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    JSON.parse(mcpConfigText);
+                    localStorage.setItem("mykizo-mcp-config", mcpConfigText);
+                    alert("MCP Configuration saved! Please restart the app to apply changes.");
+                  } catch (e) {
+                    alert("Invalid JSON format. Please fix the errors before saving.");
+                  }
+                }}
+                className="mt-2 px-3 py-1.5 text-xs font-medium bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 rounded-md transition-colors"
+              >
+                Save MCP Config
+              </button>
+            </div>
           </div>
         )}
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
-          {messages.map((msg, idx) => {
+          {messages.filter(m => m.role !== "tool").map((msg, idx, arr) => {
             const isWelcome = idx === 0 && msg.role === "assistant";
+            const isLast = idx === arr.length - 1;
+            
+            // Hide empty assistant messages unless it's the active loading bubble
+            if (msg.role === "assistant" && !msg.content && !(isLoading && isLast)) {
+              // Optionally we could render a "Used tool..." badge here if msg.tool_calls exists
+              return null;
+            }
+
             return (
               <div
                 key={idx}
@@ -1292,7 +1447,7 @@ export default function ChatPage() {
                     ) : (
                       msg.content
                     )}
-                    {msg.role === "assistant" && isLoading && !msg.content && (
+                    {msg.role === "assistant" && isLoading && !msg.content && isLast && (
                       <span className="inline-flex gap-1 items-center h-5">
                         <span className="w-1 h-1 bg-slate-400 rounded-full animate-bounce" />
                         <span className="w-1 h-1 bg-slate-400 rounded-full animate-bounce [animation-delay:0.12s]" />
@@ -1384,6 +1539,24 @@ export default function ChatPage() {
                   </svg>
                 )}
               </button>
+
+              {/* MCP Tools Toggle */}
+              {hasMcpConfigured && (
+                <button
+                  type="button"
+                  onClick={() => setMcpEnabled((v) => !v)}
+                  className={`flex-shrink-0 p-1.5 rounded-lg transition-colors ${
+                    mcpEnabled
+                      ? "text-emerald-400 bg-emerald-500/10"
+                      : "text-slate-500 hover:text-slate-300 hover:bg-white/[0.04]"
+                  }`}
+                  title={mcpEnabled ? "MCP Tools ON" : "MCP Tools OFF"}
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                  </svg>
+                </button>
+              )}
 
               {/* Voice input button */}
               {speechSupported && (
