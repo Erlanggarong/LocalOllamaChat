@@ -1419,9 +1419,9 @@ export default function ChatPage() {
             return (
               <div
                 key={idx}
-                className={`flex ${isWelcome ? "justify-end" : msg.role === "user" ? "justify-end" : "justify-start"}`}
+                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
               >
-                <div className={`max-w-[85%] ${msg.role === "user" || isWelcome ? "items-end" : "items-start"} flex flex-col gap-2`}>
+                <div className={`max-w-[85%] ${msg.role === "user" ? "items-end" : "items-start"} flex flex-col gap-2`}>
                   {msg.images && msg.images.length > 0 && (
                     <div className="flex gap-2 flex-wrap">
                       {msg.images.map((img, i) => (
@@ -1446,9 +1446,7 @@ export default function ChatPage() {
                   )}
                   <div
                     className={`px-4 py-3 text-[13px] leading-relaxed ${
-                      isWelcome
-                        ? "bg-gradient-to-br from-indigo-600/90 to-blue-600/90 text-white rounded-2xl rounded-tr-sm shadow-lg shadow-blue-900/20"
-                        : msg.role === "user"
+                      msg.role === "user"
                         ? "bg-blue-600/90 text-white rounded-2xl rounded-tr-sm shadow-lg shadow-blue-900/20"
                         : "bg-black/40 backdrop-blur-sm text-slate-300 rounded-2xl rounded-tl-sm border border-white/[0.06]"
                     }`}
