@@ -10,7 +10,7 @@ export class TauriStdioTransport implements Transport {
   private unlistenStdout?: UnlistenFn;
   private unlistenStderr?: UnlistenFn;
   private unlistenExit: UnlistenFn | null = null;
-  public sessionId: string;
+  public internalSessionId: string;
 
   constructor(
     private serverId: string,
@@ -18,14 +18,17 @@ export class TauriStdioTransport implements Transport {
     private args: string[],
     private env: Record<string, string>
   ) {
-    this.sessionId = Math.random().toString(36).substring(7);
+    this.internalSessionId = Math.random().toString(36).substring(7);
   }
 
   async start(): Promise<void> {
     try {
       // Setup event listeners
-      this.unlistenStdout = await listen<string>(`mcp_stdout_${this.serverId}_${this.sessionId}`, (event) => {
+      this.unlistenStdout = await listen<string>(`mcp_stdout_${this.serverId}_${this.internalSessionId}`, (event) => {
         try {
+          if (this.serverId === "paket-tracking") {
+            console.log(`[MCP IN] ${this.serverId}:`, event.payload);
+          }
           const message = JSON.parse(event.payload) as JSONRPCMessage;
           this._onmessage?.(message);
         } catch (e) {
@@ -33,10 +36,10 @@ export class TauriStdioTransport implements Transport {
         }
       });
 
-      this.unlistenStderr = await listen<string>(`mcp_stderr_${this.serverId}_${this.sessionId}`, (event) => {
+      this.unlistenStderr = await listen<string>(`mcp_stderr_${this.serverId}_${this.internalSessionId}`, (event) => {
       });
 
-      this.unlistenExit = await listen<string>(`mcp_exit_${this.serverId}_${this.sessionId}`, () => {
+      this.unlistenExit = await listen<string>(`mcp_exit_${this.serverId}_${this.internalSessionId}`, () => {
         this._onclose?.();
       });
 
@@ -46,7 +49,7 @@ export class TauriStdioTransport implements Transport {
         commandName: this.command,
         args: this.args,
         env: this.env,
-        sessionId: this.sessionId,
+        sessionId: this.internalSessionId,
       });
     } catch (e) {
       let errMsg = typeof e === "string" ? e : (e as any)?.message || JSON.stringify(e);
@@ -59,6 +62,9 @@ export class TauriStdioTransport implements Transport {
   async send(message: JSONRPCMessage): Promise<void> {
     try {
       const msgStr = JSON.stringify(message);
+      if (this.serverId === "paket-tracking") {
+        console.log(`[MCP OUT] ${this.serverId}:`, msgStr);
+      }
       await invoke("write_mcp_stdin", {
         id: this.serverId,
         message: msgStr,
@@ -133,13 +139,18 @@ export async function initializeMcpClients(): Promise<Record<string, Client>> {
         capabilities: {}
       });
       
-      await client.connect(transport);
-      clients[id] = client;
+      try {
+        await client.connect(transport);
+        clients[id] = client;
+      } catch (e) {
+        console.error(`[MCP] Failed to connect to server ${id}:`, e);
+      }
     }
-    } catch (err) {
-    }
-    return clients;
-  })();
+  } catch (err) {
+    console.error(`[MCP] Fatal error initializing clients:`, err);
+  }
+  return clients;
+})();
 
   return globalClientsPromise;
 }

@@ -234,8 +234,13 @@ export default function ChatPage() {
         const tools: any[] = [];
         for (const [id, client] of Object.entries(clients)) {
           try {
-            // Bypass strict zod validation on MCP SDK since some external servers return invalid schemas
-            const res = await (client as any).request({ method: "tools/list" }, z.any());
+            let res;
+            try {
+              res = await client.listTools();
+            } catch (zodErr) {
+              console.warn(`[MCP] Zod validation failed for ${id}, falling back to raw request`, zodErr);
+              res = await (client as any).request({ method: "tools/list" }, z.any());
+            }
             for (const t of res.tools) {
               tools.push({
                 type: "function",
@@ -247,8 +252,10 @@ export default function ChatPage() {
               });
             }
           } catch (err) {
+            console.error(`Failed to list tools for ${id}`, err);
           }
         }
+        console.log(`[MCP] Successfully loaded ${tools.length} tools:`, tools.map(t => t.function.name));
         setMcpTools(tools);
       });
     });
@@ -688,6 +695,9 @@ export default function ChatPage() {
             signal: abortRef.current?.signal,
           });
           if (res.ok) break;
+          
+          const errText = await res.text();
+          throw new Error(`Ollama API Error (${res.status}): ${errText}`);
         } catch (err) {
           lastErr = err as Error;
           if ((err as Error).name === "AbortError") break;
@@ -819,13 +829,14 @@ export default function ChatPage() {
         }
       } catch (err) {
         if ((err as Error).name !== "AbortError") {
+          const errMsg = (err as Error).message;
           setSessions((prev) =>
             prev.map((s) => {
               if (s.id !== activeSessionId) return s;
               const updatedMessages = [...s.messages];
               updatedMessages[updatedMessages.length - 1] = {
                 role: "assistant",
-                content: `Error: Failed to connect to Ollama at ${apiUrl}. Make sure Ollama is running.`,
+                content: `Error: Failed to connect to Ollama at ${apiUrl}. Make sure Ollama is running.\n\nDetails: ${errMsg}`,
               };
               return { ...s, messages: updatedMessages };
             })

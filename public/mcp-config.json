@@ -1,8 +1,11 @@
 {
   "mcpServers": {
-    "everything": {
+    "web-search": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-puppeteer"
+      ],
       "env": {}
     }
   }
